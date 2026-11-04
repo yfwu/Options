@@ -1,11 +1,12 @@
 """Block-bootstrap analysis (3-year paths, mean block 60d, joint return + vol-index changes)."""
-import json
+import json, os
+PRE = os.environ.get('BOOT_PRE', 'boot')
 import numpy as np, pandas as pd
 md = []
 summ = []
 for sym in ['qqq', 'spy']:
     for tag in ['uncond', 'stress']:
-        recs = [json.loads(l) for l in open(f'out/boot_{sym}_{tag}.jsonl')]
+        recs = [json.loads(l) for l in open(f'out/{PRE}_{sym}_{tag}.jsonl')]
         rows = []
         for r in recs:
             base = dict(bh_mdd=r['bh']['mdd'], bh_min=r['bh']['min_eq'], bh_fm=r['bh']['final_mult'])
@@ -27,6 +28,6 @@ for sym in ['qqq', 'spy']:
             md.append("|---|---|---|---|---|---|---|")
             for c, x in g.iterrows():
                 md.append(f"| {c} | {x.p_near*100:.1f}% | {x.p_loss50*100:.1f}% | {x.mdd_med*100:.0f}% | {x.mdd_p5*100:.0f}% | {x.fm_med:.2f} | {x.fm_p5:.2f} |")
-pd.concat(summ).to_csv('out/boot_summary.csv', index=False)
-open('out/boot_tables.md', 'w').write("\n".join(md))
+pd.concat(summ).to_csv(f'out/{PRE}_summary.csv', index=False)
+open(f'out/{PRE}_tables.md', 'w').write("\n".join(md))
 print("\n".join(md))

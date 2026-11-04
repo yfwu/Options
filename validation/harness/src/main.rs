@@ -318,6 +318,9 @@ struct JobOut {
     bh_sharpe: f64,
     bh_vol: f64,
     h: Option<[HStats; 4]>,
+    engine_min_equity_ratio: f64,
+    engine_near_wipe: bool,
+    matched_cagr: Option<f64>,
 }
 
 fn write_records(path: &str, r: &BacktestResult) -> Result<()> {
@@ -389,6 +392,9 @@ fn run_jobs(jobs_path: &str, out_path: &str) -> Result<()> {
                 ann_vol: r.stats.ann_vol,
                 bh_sharpe: r.benchmark_stats[0].1.sharpe,
                 bh_vol: r.benchmark_stats[0].1.ann_vol,
+                engine_min_equity_ratio: r.min_equity_ratio,
+                engine_near_wipe: r.near_wipe,
+                matched_cagr: r.benchmark_stats.get(2).map(|b| b.1.cagr),
                 h: j.horizon_days.map(|hd| [h_stats(&curve, hd), h_stats(bh, hd), h_stats(&l2, hd), h_stats(&l3, hd)]),
             })
         })
@@ -591,9 +597,9 @@ fn boot(spec_path: &str, out: &str) -> Result<()> {
 
 fn dump_inputs(out: &str) -> Result<()> {
     // aligned daily inputs the engine sees (for the Python re-implementation)
-    for key in ["qqq", "qqq_bc", "spy"] {
+    for key in ["qqq", "qqq_bc", "spy", "qqq_preset:dgs3mo", "spy:dgs3mo"] {
         let d = load_data(key)?;
-        let mut f = std::io::BufWriter::new(std::fs::File::create(format!("{out}/inputs_{key}.csv"))?);
+        let mut f = std::io::BufWriter::new(std::fs::File::create(format!("{out}/inputs_{}.csv", key.replace(':', "_")))?);
         writeln!(f, "date,adj,vol,rate")?;
         for b in &d.prices.bars {
             writeln!(f, "{},{:.10},{:.6},{:.8}", b.date, b.adj_close, d.vol_index.value_at(b.date).unwrap().max(1.0), d.rate.rate_at(b.date))?;

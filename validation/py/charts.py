@@ -149,3 +149,32 @@ for ax, sym in zip(axes, ['qqq', 'spy']):
     ax.legend(fontsize=8.5, loc='upper left')
 fig.tight_layout(); fig.savefig(f'{OUT}/fig6_bootstrap.png', dpi=150); plt.close(fig)
 print('ok')
+
+# 7. before / after (engine >= 6a0d2a3)
+import os
+if os.path.exists('out/after_attr.csv'):
+    a = pd.read_csv('out/after_attr.csv')
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5.2))
+    vars_ = ['A 舊引擎（修正前）', 'B 新引擎預設（舊資料）', 'C 新引擎 + 新資料（真實VXN/DGS3MO）', 'D = C + 保守成本']
+    short = ['A 修正前', 'B 新引擎', 'C 新引擎+新資料', 'D C+保守成本']
+    for k, sym in enumerate(['qqq', 'spy']):
+        ax = axes[k]
+        s = a[(a.sym == sym) & (a.per == 'full')]
+        xs = np.arange(3)
+        for i, v in enumerate(vars_):
+            y = [s[(s.exp == e) & (s['var'] == v)].ex_bh.iloc[0] for e in [1.0, 1.5, 2.0]]
+            ax.bar(xs + (i - 1.5) * 0.2, y, width=0.18, color=C[i], label=short[i])
+        ax.axhline(0, color=INK2, lw=0.8)
+        ax.set_xticks(xs); ax.set_xticklabels(['1.0x', '1.5x', '2.0x'])
+        ax.set_ylabel('CAGR − 買進持有 (%/年)'); ax.set_title(f'{sym.upper()} 0.80Δ 全期超額：修正前後')
+        if k == 0: ax.legend(fontsize=8.5)
+    ax = axes[2]
+    for i, (sym, ls) in enumerate([('qqq', '-'), ('spy', (0, (4, 2)))]):
+        b = pd.read_csv(f'out/before/survival_{sym}_engine.csv').groupby('exp').near.mean() * 100
+        f = pd.read_csv(f'out/survival_{sym}_engine_after.csv').groupby('exp').near.mean() * 100
+        ax.plot(b.index, b.values, color=C[0], ls=ls, marker='o', ms=6, label=f'{sym.upper()} 修正前')
+        ax.plot(f.index, f.values, color=C[1], ls=ls, marker='s', ms=6, label=f'{sym.upper()} 修正後')
+    ax.set_xlabel('目標曝險'); ax.set_ylabel('P(3 年內權益 < 10%) (%)'); ax.set_title('危機網格近歸零機率（平均各 Δ）')
+    ax.legend(fontsize=8.5)
+    fig.tight_layout(); fig.savefig(f'{OUT}/fig7_before_after.png', dpi=150); plt.close(fig)
+    print('fig7 ok')

@@ -23,4 +23,7 @@ t = t.replace('{BOOT}', "\n".join(rows))
 open('../docs/validation/REPORT.md', 'w').write(t)
 shutil.copy('out/stress_tables.md', '../docs/validation/stress_tables.md')
 shutil.copy('out/boot_tables.md', '../docs/validation/boot_tables.md')
+import os
+for f in ['stress_tables_after.md', 'boot_after_tables.md']:
+    if os.path.exists(f'out/{f}'): shutil.copy(f'out/{f}', f'../docs/validation/{f}')
 print('REPORT.md', len(t))

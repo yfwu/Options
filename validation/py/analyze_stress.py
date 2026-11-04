@@ -1,8 +1,9 @@
 """Task 3 analysis: tables (markdown) + charts from out/stress.jsonl."""
-import json, sys
+import json, sys, os
+IN = os.environ.get("STRESS_IN", "out/stress.jsonl"); SUF = os.environ.get("STRESS_SUF", "")
 import numpy as np, pandas as pd
 rows = []
-for l in open('out/stress.jsonl'):
+for l in open(IN):
     o = json.loads(l)
     sym, crash, off, scen, d, e, ed, rd = o['name'].split('|')
     h = o['h']
@@ -13,7 +14,7 @@ for l in open('out/stress.jsonl'):
                      l3_mdd=h[3]['mdd'], l3_min=h[3]['min_eq'], l3_rec=h[3]['days_to_recover_initial'],
                      wiped=o['wiped'], data_end=o['end']))
 df = pd.DataFrame(rows)
-df.to_csv('out/stress_flat.csv', index=False)
+df.to_csv(f'out/stress_flat{SUF}.csv', index=False)
 CR = list(dict.fromkeys(df.crash))
 def yrs(x):
     return '未回本' if pd.isna(x) else f"{x/365.25:.1f}"
@@ -42,7 +43,7 @@ for sym in ['qqq', 'spy']:
         g = s.groupby(['exp', 'delta']).agg(near=('min_eq', lambda x: (x < 0.10).mean()), wipe=('wiped', 'mean'),
                                             worst_mdd=('mdd', 'min'), med_mdd=('mdd', 'median'), p_dd70=('mdd', lambda x: (x < -0.7).mean()),
                                             unrec=('rec', lambda x: x.isna().mean()))
-        g.to_csv(f'out/survival_{sym}_{scen}.csv')
+        g.to_csv(f'out/survival_{sym}_{scen}{SUF}.csv')
         md.append(f"\n### {sym.upper()} 存活表（{ '引擎預設假設' if scen=='engine' else ('保守假設：真實 VXN(2000-10 起)/DGS3MO/κ=3/半價差 1%+滑價 0.25%' if sym=='qqq' else '保守假設：DGS3MO/κ=3/半價差 1%+滑價 0.25%') }）\n")
         md.append(f"樣本 = {len(CR) if sym=='qqq' else len(CR)} 次危機 × 4 個起點 × 3 entry DTE × 3 roll DTE（每格 n={int(len(s)/20)}）。格式：P(權益<10%) / 最差 3 年 MDD / 中位 MDD / P(到資料結束仍未回本)\n")
         md.append("| 曝險 \\ Δ | 0.6 | 0.7 | 0.8 | 0.9 |")
@@ -99,5 +100,5 @@ for sym in ['qqq', 'spy']:
     for n, col in [('B&H', 'bh_tp'), ('2x ETF', 'l2_tp'), ('3x ETF', 'l3_tp')]:
         x = bm[col]
         md.append(f"| {n} | — | {x.median()/365.25:.1f} | {x.quantile(.75)/365.25:.1f} | {x.max()/365.25:.1f} | {x.isna().mean()*100:.0f}% |")
-open('out/stress_tables.md', 'w').write("\n".join(md))
+open(f'out/stress_tables{SUF}.md', 'w').write("\n".join(md))
 print("\n".join(md[:60]))

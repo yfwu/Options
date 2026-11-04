@@ -91,6 +91,8 @@ class VolModel:
     min_vol: float = 0.08
     max_vol: float = 1.8
     call_wing_factor: float = 0.5
+    # two-factor term structure (engine >= 6a0d2a3 default); None = single kappa
+    two_factor: Optional[tuple] = None   # (fast_kappa, slow_kappa, fast_weight)
 
     @staticmethod
     def spy():
@@ -103,8 +105,12 @@ class VolModel:
     def atm(self, t, vix):
         t = max(t, 1 / 365)
         short = max(vix / 100 * self.iv_scale, 0)
-        kt = self.kappa * t
-        w = 1.0 if kt < 1e-8 else (1 - math.exp(-kt)) / kt
+        rw = lambda k: 1.0 if k * t < 1e-8 else (1 - math.exp(-k * t)) / (k * t)
+        if self.two_factor:
+            kf, ks, fw = self.two_factor
+            w = fw * rw(kf) + (1 - fw) * rw(ks)
+        else:
+            w = rw(self.kappa)
         return min(max(self.long_run_vol + (short - self.long_run_vol) * w, self.min_vol), self.max_vol)
 
     def iv(self, k, s, t, vix):
@@ -115,7 +121,21 @@ class VolModel:
         slope = self.skew_slope if x < 0 else self.skew_slope * self.call_wing_factor
         return min(max(a + m * (-slope * x + self.smile_curv * x * x), self.min_vol), self.max_vol)
 
+    def strike_for_delta_fixedpoint(self, D, s, t, r, q, vix):
+        """the engine's damped fixed point (6 iterations), for path-dependence tests"""
+        v = self.atm(t, vix)
+        k = strike_for_call_delta(D, s, t, r, q, v)
+        for _ in range(6):
+            nv = self.iv(k, s, t, vix)
+            if abs(nv - v) < 1e-6:
+                break
+            v = 0.5 * v + 0.5 * nv
+            k = strike_for_call_delta(D, s, t, r, q, v)
+        return k
+
     def strike_for_delta(self, D, s, t, r, q, vix):
+        if getattr(self, 'fixed_point', False):
+            return self.strike_for_delta_fixedpoint(D, s, t, r, q, vix)
         """solve delta(K, iv(K)) = D exactly (root find on K) -- independent of the
         Rust damped fixed point."""
         def f(k):
@@ -205,7 +225,7 @@ class Cfg:
     initial: float = 100_000.0
     mult: float = 100.0
     # validation knobs (not in the engine)
-    trade_lag: int = 0          # 0 = decide & trade at the same close (engine); 1 = decide at t, fill at t+1 close
+    trade_lag: int = 0          # 0 = decide & trade at the same close; L = signal at t, fill at close t+L (sizes recomputed then)
     floor_intrinsic: bool = True
 
 
@@ -271,10 +291,17 @@ def backtest(df: pd.DataFrame, cfg: Cfg, q: float, start=None, end=None, record=
             elif cfg.band > 0 and abs(expo / cfg.exposure - 1) > cfg.band:
                 act = "roll" if abs(delta - cfg.delta) > cfg.restrike_gap else "rebal"
         if cfg.trade_lag:
-            # decide at today's close, execute at the next close (no same-close info)
-            act, pending = pending, act
-            if act is not None:
-                pending = None
+            # signal at today's close, executed at the close of day i+lag; signals seen
+            # while an order is pending are dropped
+            sig = act
+            if pending is None and sig is not None:
+                pending = (sig, i + cfg.trade_lag)
+            if pending is not None and i >= pending[1]:
+                act, pending = pending[0], None
+            else:
+                act = None
+            if pos is None and act in ("roll", "rebal"):
+                act = "open"
         if act == "rebal" and pos is not None:
             tgt = cfg.exposure * equity / (delta * s * cfg.mult)
             n = pos[2]
