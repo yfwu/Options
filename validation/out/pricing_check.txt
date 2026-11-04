@@ -1,0 +1,29 @@
+# 定價核對 (pricing.rs vs scipy)
+格點數: 11524
+price  max|abs err| = 2.79e-09   max rel err (|ref|>1e-6) = 2.18e-09
+delta  max|abs err| = 2.24e-11   max rel err (|ref|>1e-6) = 9.39e-11
+gamma  max|abs err| = 5.55e-17   max rel err (|ref|>1e-6) = 7.68e-16
+theta  max|abs err| = 5.57e-13   max rel err (|ref|>1e-6) = 4.68e-09
+vega   max|abs err| = 2.22e-16   max rel err (|ref|>1e-6) = 9.12e-16
+rho    max|abs err| = 6.55e-11   max rel err (|ref|>1e-6) = 9.38e-11
+IV 反解 (vega>1e-4 per pt): max |iv - sigma| = 6.29e-09, NaN 數 = 0
+  |iv-sigma|>1e-6 的格點: 0
+strike_for_delta(0.80) 反算 delta 誤差 max = 2.15e-13
+
+Hull 教科書數值:
+kind  s  k        t    r  sigma    price     delta    gamma     theta     vega       rho
+Call 42 40 0.500000 0.10    0.2 4.759422  0.779131 0.049963 -0.012491 0.088134  0.139820
+ Put 42 40 0.500000 0.10    0.2 0.808599 -0.220869 0.049963 -0.002066 0.088134 -0.050425
+Call 49 50 0.384615 0.05    0.2 2.400527  0.521605 0.065544 -0.011795 0.121055  0.089070
+ Put 49 50 0.384615 0.05    0.2 2.448175 -0.478395 0.065544 -0.005077 0.121055 -0.099575
+Hull 例 15.6: c=4.76, p=0.81；例 19.x (S=49,K=50,T=20/52,r=5%,σ=20%): c≈2.40, Δ=0.522, Γ=0.066, Θ=-4.31/年 (=-0.0118/日), vega=12.1/1.00 (=0.121/vol pt), ρ=8.91/1.00 (=0.0891/pt)
+
+合成曲面: max|ATM 差| = 5.0e-13, max|IV 差| = 5.0e-13
+strike_for_delta(曲面): Rust 阻尼不動點 vs 精確求根 max|ΔK| = 0.2081 (S=100), Rust 履約價的實際 delta 偏差 max = 0.0058
+model  vix     t      kd80  delta_kd80
+  spy    9 0.020 98.559600    0.794173
+  spy    9 0.083 97.107504    0.794796
+  spy   12 0.020 98.203615    0.795641
+  spy    9 0.250 94.899879    0.795725
+  qqq    9 0.020 98.654606    0.795928
+  spy   12 0.083 96.432725    0.796069

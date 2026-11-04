@@ -1,0 +1,11 @@
+harness/target/
+# large / regenerable outputs (run ./run_all.sh)
+out/*.jsonl
+out/jobs_*.json
+out/boot_*.json
+out/curves/
+out/crash_curves/
+out/stress_flat.csv
+out/rust_pricing.csv
+out/inputs_*.csv
+__pycache__/
