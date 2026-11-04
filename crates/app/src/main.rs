@@ -114,7 +114,8 @@ fn main() {
                     let view = cx.new(|cx| OptLabApp::new(page, autorun, window, cx));
                     cx.new(|cx| Root::new(view, window, cx))
                 },
-            )?;
+            )
+            .inspect_err(|e| eprintln!("optlab: failed to open window: {e:#}"))?;
             Ok::<_, anyhow::Error>(())
         })
         .detach();

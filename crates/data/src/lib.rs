@@ -20,6 +20,7 @@ pub mod bundled;
 pub mod config;
 pub mod csv_import;
 pub mod history;
+pub mod presets;
 pub mod http;
 pub mod providers;
 pub mod store;
@@ -449,6 +450,12 @@ impl DataService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn service_is_send_sync() {
+        fn check<T: Send + Sync>() {}
+        check::<DataService>();
+    }
+
     #[test]
     fn provider_roundtrip() {
         for p in Provider::ALL {

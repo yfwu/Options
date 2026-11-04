@@ -479,14 +479,14 @@ pub fn advise_with(snap: &MarketSnapshot, best: Option<&OptRow>, current: Option
         format!(
             "假設超額報酬 μ−r = {}、σ = {}（市場 1 年 IV {} 與長期 {} 平均），Kelly f* = (μ−r)/σ² ≈ {kelly:.2}。波動拖累 ≈ L²σ²/2：{g_txt} \
              超過全 Kelly 後長期複利反而下降，且回撤急遽擴大；參數估計誤差（μ 很難估準）讓實務上多採半 Kelly 或更低。\
-             穩健槓桿 beta 建議 {} 曝險 {:.1}–{:.1}x。",
+             穩健槓桿 beta 建議 {} 曝險約 0.6–0.9 倍 Kelly，即 {:.1}–{:.1}x。",
             pc(a.equity_premium),
             pc(sigma),
             pc(sigma_mkt),
             pc(a.long_run_vol),
             sym,
-            (0.5 * kelly).clamp(0.8, 1.3),
-            (0.75 * kelly).clamp(1.0, 2.0)
+            (0.6 * kelly).clamp(0.5, 1.5),
+            (0.9 * kelly).clamp(0.8, 2.0)
         ),
     ));
 
@@ -691,7 +691,7 @@ pub fn strategy_conclusions() -> Vec<Advice> {
             "總結：目標是「穩健的槓桿 beta」，不是 alpha",
             "長期看多美國大型股時，報酬主要來自股票風險溢酬（歷史上約 5–7%/年超額）。槓桿能放大溢酬，但也以 L² 放大變異數：長期幾何報酬 ≈ r + L(μ−r) − L²σ²/2。\
              因此存在最佳槓桿（Kelly），超過之後報酬反而下降、破產風險急升。所有工具（融資、槓桿 ETF、期貨、LEAPS）本質都是在「以多少成本借錢」與「如何控制曝險路徑」上取捨。\
-             本引擎的結論：以 0.70–0.85Δ、12–24 個月 LEAPS 滾動、維持 1.2–1.6x（SPY）或 1.0–1.4x（QQQ）曝險、閒置資金放 T-Bill，是成本與風險控制都相對穩健的做法。",
+             本引擎的結論：以 0.70–0.85Δ、12–24 個月 LEAPS 滾動、維持約 1.0–1.5x（SPY）或 0.8–1.3x（QQQ）曝險（約 0.6–0.9 倍 Kelly）、閒置資金放 T-Bill，是成本與風險控制都相對穩健的做法。",
         ),
         adv(
             Info,
