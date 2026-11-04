@@ -178,7 +178,7 @@ impl SynthVolModel {
             .filter(|(d, iv)| *d >= 14 && iv.is_finite() && *iv > 0.01 && *iv < 3.0)
             .map(|(d, iv)| (*d as f64 / 365.0, *iv))
             .collect();
-        if pts.len() < 2 || !(vol_index_pts > 0.0) {
+        if pts.len() < 2 || vol_index_pts.is_nan() || vol_index_pts <= 0.0 {
             return None;
         }
         let err = |m: &SynthVolModel| -> f64 {
@@ -190,14 +190,14 @@ impl SynthVolModel {
             }
             (se / sw).sqrt()
         };
-        let mut best = (self.clone(), err(self));
+        let mut best = (*self, err(self));
         // Coarse grid then two refinements: σ_LR ∈ [8%, 60%], iv_scale ∈ [0.6, 1.3].
         let (mut lo_l, mut hi_l, mut lo_s, mut hi_s) = (0.08, 0.60, 0.60, 1.30);
         for _ in 0..3 {
             let n = 26;
             for i in 0..=n {
                 for j in 0..=n {
-                    let mut m = self.clone();
+                    let mut m = *self;
                     m.long_run_vol = lo_l + (hi_l - lo_l) * i as f64 / n as f64;
                     m.iv_scale = lo_s + (hi_s - lo_s) * j as f64 / n as f64;
                     let e = err(&m);

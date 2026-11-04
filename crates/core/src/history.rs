@@ -70,7 +70,7 @@ impl PriceSeries {
         let bars = self
             .bars
             .iter()
-            .filter(|b| start.map_or(true, |s| b.date >= s) && end.map_or(true, |e| b.date <= e))
+            .filter(|b| start.is_none_or(|s| b.date >= s) && end.is_none_or(|e| b.date <= e))
             .copied()
             .collect();
         PriceSeries { symbol: self.symbol.clone(), bars }
