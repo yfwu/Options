@@ -7,7 +7,7 @@ for l in open('out/stress.jsonl'):
     sym, crash, off, scen, d, e, ed, rd = o['name'].split('|')
     h = o['h']
     rows.append(dict(sym=sym, crash=crash, off=off, scen=scen, delta=float(d), exp=float(e), entry=int(ed), roll=int(rd),
-                     start=o['start'], mdd=h[0]['mdd'], min_eq=h[0]['min_eq'], end3=h[0]['end_mult'], rec=h[0]['days_to_recover_initial'],
+                     start=o['start'], tp=h[0]['days_trough_to_peak'], bh_tp=h[1]['days_trough_to_peak'], l2_tp=h[2]['days_trough_to_peak'], l3_tp=h[3]['days_trough_to_peak'], mdd=h[0]['mdd'], min_eq=h[0]['min_eq'], end3=h[0]['end_mult'], rec=h[0]['days_to_recover_initial'],
                      bh_mdd=h[1]['mdd'], bh_min=h[1]['min_eq'], bh_rec=h[1]['days_to_recover_initial'],
                      l2_mdd=h[2]['mdd'], l2_min=h[2]['min_eq'], l2_rec=h[2]['days_to_recover_initial'],
                      l3_mdd=h[3]['mdd'], l3_min=h[3]['min_eq'], l3_rec=h[3]['days_to_recover_initial'],
@@ -76,5 +76,28 @@ for c in CR:
         r = [c, f"{o} ({x.start.iloc[0]})"] + [f"{x[x.exp==e].mdd.iloc[0]*100:.0f}% / {x[x.exp==e].min_eq.iloc[0]:.2f}" for e in [1.0, 1.5, 2.0, 3.0]]
         r += [f"{x.bh_mdd.iloc[0]*100:.0f}% / {x.bh_min.iloc[0]:.2f}", f"{x.l3_mdd.iloc[0]*100:.0f}% / {x.l3_min.iloc[0]:.2f}"]
         md.append("| " + " | ".join(r) + " |")
+# Recovery tables: trough -> prior peak
+def ty(x):
+    return '未回' if pd.isna(x) else f"{x/365.25:.1f}"
+for sym in ['qqq', 'spy']:
+    md.append(f"\n### {sym.upper()} 回本時間：3 年內最大回撤谷底 → 回到前高（年；高點建倉，0.80Δ 540/180，引擎假設；「未回」= 至資料結束 2026 仍未回到前高）\n")
+    md.append("| 危機 | B&H | 2x ETF | 3x ETF | LEAPS 1.0x | 1.25x | 1.5x | 2.0x | 3.0x |")
+    md.append("|---|---|---|---|---|---|---|---|---|")
+    for c in CR:
+        x = df[(df.sym == sym) & (df.crash == c) & (df.off == '高點') & (df.delta == 0.8) & (df.entry == 540) & (df.roll == 180) & (df.scen == 'engine')]
+        if x.empty: continue
+        b = x.iloc[0]
+        md.append(f"| {c} | {ty(b.bh_tp)} | {ty(b.l2_tp)} | {ty(b.l3_tp)} | " + " | ".join(ty(x[x.exp == e].tp.iloc[0]) for e in [1.0, 1.25, 1.5, 2.0, 3.0]) + " |")
+    md.append(f"\n### {sym.upper()} 回本時間分布（全部 10 危機 × 4 起點 × 4 Δ × 9 DTE；年）\n")
+    md.append("| 曝險 | 假設 | 中位 | 75% 分位 | 最長（已回本者） | 未回本比例 |")
+    md.append("|---|---|---|---|---|---|")
+    for e in [1.0, 1.25, 1.5, 2.0, 3.0]:
+        for scen in ['engine', 'conservative']:
+            x = df[(df.sym == sym) & (df.exp == e) & (df.scen == scen)].tp
+            md.append(f"| {e}x | {'引擎' if scen=='engine' else '保守'} | {x.median()/365.25:.1f} | {x.quantile(.75)/365.25:.1f} | {x.max()/365.25:.1f} | {x.isna().mean()*100:.0f}% |")
+    bm = df[(df.sym == sym) & (df.scen == 'engine')].drop_duplicates(['crash', 'off'])
+    for n, col in [('B&H', 'bh_tp'), ('2x ETF', 'l2_tp'), ('3x ETF', 'l3_tp')]:
+        x = bm[col]
+        md.append(f"| {n} | — | {x.median()/365.25:.1f} | {x.quantile(.75)/365.25:.1f} | {x.max()/365.25:.1f} | {x.isna().mean()*100:.0f}% |")
 open('out/stress_tables.md', 'w').write("\n".join(md))
 print("\n".join(md[:60]))

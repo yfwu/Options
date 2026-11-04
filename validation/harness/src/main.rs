@@ -197,6 +197,9 @@ struct HStats {
     end_mult: f64,
     /// calendar days from start until equity regains the initial value after the horizon minimum (None = never)
     days_to_recover_initial: Option<i64>,
+    /// calendar days from the horizon max-drawdown trough until equity regains the prior peak (full curve; None = never)
+    days_trough_to_peak: Option<i64>,
+    trough_date: String,
 }
 
 fn h_stats(c: &[(NaiveDate, f64)], horizon: i64) -> HStats {
@@ -207,17 +210,21 @@ fn h_stats(c: &[(NaiveDate, f64)], horizon: i64) -> HStats {
     let mut peak = v0;
     let mut mdd: f64 = 0.0;
     let mut min_i = 0;
+    let (mut tr_i, mut pk_at) = (0usize, v0);
     for (i, &(_, v)) in h.iter().enumerate() {
         peak = peak.max(v);
-        if peak > 0.0 {
-            mdd = mdd.min(v / peak - 1.0);
+        if peak > 0.0 && v / peak - 1.0 < mdd {
+            mdd = v / peak - 1.0;
+            tr_i = i;
+            pk_at = peak;
         }
         if v < h[min_i].1 {
             min_i = i;
         }
     }
     let rec = if h[min_i].1 >= v0 { Some(0) } else { c[min_i..].iter().find(|p| p.1 >= v0).map(|p| (p.0 - c[0].0).num_days()) };
-    HStats { mdd, min_eq: h[min_i].1 / v0, end_mult: h[m - 1].1 / v0, days_to_recover_initial: rec }
+    let tp = if mdd < 0.0 { c[tr_i..].iter().find(|p| p.1 >= pk_at).map(|p| (p.0 - c[tr_i].0).num_days()) } else { Some(0) };
+    HStats { mdd, min_eq: h[min_i].1 / v0, end_mult: h[m - 1].1 / v0, days_to_recover_initial: rec, days_trough_to_peak: tp, trough_date: c[tr_i].0.to_string() }
 }
 
 #[derive(Serialize, Default)]

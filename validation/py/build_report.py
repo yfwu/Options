@@ -8,6 +8,7 @@ md = open('out/stress_tables.md').read()
 secs = {s.split('\n')[0]: s for s in re.split(r'\n(?=### )', md) if s.strip()}
 pick = lambda pref: [v.replace('### ', '#### ', 1) for k, v in secs.items() if k.startswith(pref)]
 t = t.replace('{PEAK_TABLES}', "格式：3 年內 MDD / 最低權益（倍數）/ 回本年數（💀 = 引擎 wipe-out）\n\n" + "\n\n".join(pick('### QQQ：於高點') + pick('### SPY：於高點')))
+t = t.replace('{RECOVERY}', "\n\n".join(pick('### QQQ 回本時間') + pick('### SPY 回本時間')))
 t = t.replace('{SURVIVAL_TABLES}', "\n\n".join(pick('### QQQ 存活表') + pick('### SPY 存活表')))
 b = pd.read_csv('out/boot_summary.csv')
 names = {'B&H': '買進持有', '2x ETF': '2x ETF', '3x ETF': '3x ETF', 'd0.8_1.0x': 'LEAPS 0.8Δ 1.0x', 'd0.8_1.5x': 'LEAPS 0.8Δ 1.5x', 'd0.8_2.0x': 'LEAPS 0.8Δ 2.0x',
