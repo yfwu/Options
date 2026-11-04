@@ -9,6 +9,9 @@ pub mod pricing;
 pub mod strategy;
 pub mod surface;
 pub mod montecarlo;
+pub mod synth;
+pub mod stats;
+pub mod backtest;
 
 pub use chain::{ExerciseStyle, OptionChain, OptionKind, OptionQuote};
 pub use history::{Bar, PriceSeries, ScalarSeries};

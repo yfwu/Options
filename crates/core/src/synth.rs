@@ -9,7 +9,8 @@
 //! σ_ATM(T)      = σ_LR + (σ_short − σ_LR) · (1 − e^{−κT}) / (κT)  (mean-reverting term structure)
 //! x             = ln(K/S) / √T                                   (time-scaled log-moneyness)
 //! m             = clamp(√(skew_ref_vol / σ_ATM(T)), 0.7, 1.5)    (skew is steeper when vol is low)
-//! σ(K, T)       = σ_ATM(T) + m · (−skew_slope · x + smile_curv · x²)
+//! σ(K, T)       = σ_ATM(T) + m · (−skew_slope · x + smile_curv · x²)   (x < 0)
+//!                 slope halved on the call wing (x > 0, `CALL_WING_FACTOR`)
 //! ```
 //!
 //! clamped to `[min_vol, max_vol]`. With `skew_slope > 0` lower strikes carry a
@@ -32,6 +33,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::chain::OptionKind;
 use crate::pricing::{bs_greeks, bs_price, strike_for_delta, Greeks};
+
+/// Upside (x > 0) skew slope as a fraction of `skew_slope`: equity call wings are flatter.
+pub const CALL_WING_FACTOR: f64 = 0.5;
 
 /// Implied-volatility surface driven by a volatility index. See module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -114,7 +118,9 @@ impl SynthVolModel {
         }
         let x = ((strike / spot).ln() / t.sqrt()).clamp(-2.5, 2.5);
         let m = (self.skew_ref_vol / atm).sqrt().clamp(0.7, 1.5);
-        (atm + m * (-self.skew_slope * x + self.smile_curv * x * x)).clamp(self.min_vol, self.max_vol)
+        // the call wing (x > 0) is flatter than the put wing
+        let slope = if x < 0.0 { self.skew_slope } else { self.skew_slope * CALL_WING_FACTOR };
+        (atm + m * (-slope * x + self.smile_curv * x * x)).clamp(self.min_vol, self.max_vol)
     }
 
     /// Model mid price.
