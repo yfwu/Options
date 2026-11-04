@@ -351,7 +351,7 @@ impl BacktestPage {
             let bh: Vec<(f64, f64)> = bs.yearly.iter().map(|(y, r)| (*y as f64 + 0.18, *r)).collect();
             yearly = yearly.series(Series::bars(name.clone(), bh, p.muted, 0.36));
         }
-        Charts { equity, equity_log, drawdown, exposure, yearly: yearly.into_rc() }
+        Charts { equity, equity_log, drawdown: drawdown.into_rc(), exposure, yearly: yearly.into_rc() }
     }
 
     fn render_form(&self, cx: &mut Context<Self>) -> impl IntoElement {

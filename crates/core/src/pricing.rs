@@ -18,8 +18,19 @@ pub fn norm_pdf(x: f64) -> f64 {
     (-0.5 * x * x).exp() / (2.0 * PI).sqrt()
 }
 
-/// Standard normal cumulative distribution (via erfc, ~1e-15 accuracy).
+/// Standard normal cumulative distribution.
+///
+/// Delegates to West's (2005) double-precision implementation of Hart's algorithm
+/// in [`crate::synth::fast_norm_cdf`]: ≤1e-16 absolute error (≈1e-15 relative in the body,
+/// ≈1e-9 relative in the far tail) and branch-cheap,
+/// which matters because the backtester and optimizer call it millions of times.
+#[inline]
 pub fn norm_cdf(x: f64) -> f64 {
+    crate::synth::fast_norm_cdf(x)
+}
+
+/// Reference implementation via the continued-fraction `erfc` (slower; kept for tests).
+pub fn norm_cdf_erfc(x: f64) -> f64 {
     0.5 * erfc(-x / SQRT_2)
 }
 
@@ -383,7 +394,23 @@ mod tests {
         assert!((norm_cdf(0.0) - 0.5).abs() < 1e-15);
         assert!((norm_cdf(1.96) - 0.9750021048517795).abs() < 1e-12);
         assert!((norm_cdf(-3.0) - 0.0013498980316301).abs() < 1e-13);
-        assert!((norm_cdf(-8.0) - 6.22096057427178e-16).abs() < 1e-24);
+        // Beyond ~7σ the tail fraction is ~1e-8 relative but ~1e-23 absolute.
+        assert!((norm_cdf(-8.0) - 6.220960574271819e-16).abs() < 1e-22, "{}", norm_cdf(-8.0));
+        // Reference values from CPython's math.erfc (correctly rounded libm).
+        for (x, want) in [
+            (-6.5, 4.016000583859118e-11),
+            (-3.3, 0.0004834241423837776),
+            (-1.0, 0.15865525393145707),
+            (-0.75, 0.2266273523768682),
+        ] {
+            let got = norm_cdf(x);
+            // Absolute error ≤ 1e-16 everywhere; relative ≤ 1e-13 in the body.
+            assert!((got - want).abs() < 1e-16, "x={x} {got} {want}");
+            if x > -4.0 {
+                assert!(((got - want) / want).abs() < 1e-13, "x={x} {got} {want}");
+            }
+            assert!((norm_cdf_erfc(x) - want).abs() < 1e-10, "erfc x={x}");
+        }
         for p in [1e-6, 0.01, 0.3, 0.5, 0.77, 0.999] {
             assert!((norm_cdf(norm_inv(p)) - p).abs() < 1e-12, "p={p}");
         }
