@@ -97,7 +97,7 @@ impl BacktestPage {
         let q = data_bridge::default_dividend_yield(&sym);
         let i = |v: String, window: &mut Window, cx: &mut Context<Self>| new_input(v, window, cx);
         let inp = Inputs {
-            start: new_input_ph("2010-01-01", "YYYY-MM-DD (空白=全部)", window, cx),
+            start: new_input_ph("", "YYYY-MM-DD (空白=全部歷史，含 2000/2008 股災)", window, cx),
             end: new_input_ph("", "YYYY-MM-DD (空白=最新)", window, cx),
             capital: i(format!("{}", cfg.initial_capital), window, cx),
             strike_val: i("0.80".into(), window, cx),

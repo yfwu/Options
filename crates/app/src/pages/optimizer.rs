@@ -120,7 +120,7 @@ impl OptimizerPage {
         let g = ParamGrid::default();
         let join = |v: Vec<String>| v.join(", ");
         let inp = Inputs {
-            start: new_input_ph("2010-01-01", "YYYY-MM-DD", window, cx),
+            start: new_input_ph("", "YYYY-MM-DD (空白=全部歷史，含 2000/2008 股災)", window, cx),
             end: new_input_ph("", "空白 = 最新", window, cx),
             deltas: new_input(join(g.deltas.iter().map(|d| format!("{d}")).collect()), window, cx),
             entry: new_input(join(g.entry_dtes.iter().map(|d| d.to_string()).collect()), window, cx),
@@ -128,7 +128,7 @@ impl OptimizerPage {
             exposure: new_input(join(g.exposures.iter().map(|d| format!("{d}")).collect()), window, cx),
             roll_up: new_input("無, 0.95", window, cx),
             min_hold: new_input(g.min_hold_days.to_string(), window, cx),
-            lambda: new_input("0.25", window, cx),
+            lambda: new_input("0.5", window, cx),
             dd_cap: new_input("50", window, cx),
             top_n: new_input("30", window, cx),
             boot_n: new_input("200", window, cx),
