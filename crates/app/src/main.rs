@@ -96,8 +96,9 @@ fn main() {
         let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
         let page = opts.page;
         let autorun = opts.autorun;
+        let shell_slot: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Shell>>>> = Default::default();
         cx.spawn(async move |cx| {
-            cx.open_window(
+            let handle = cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
@@ -111,13 +112,53 @@ fn main() {
                 |window, cx| {
                     // Re-apply our palette in case gpui-component synced to the system appearance.
                     theme::apply(cx);
-                    let view = cx.new(|cx| OptLabApp::new(page, autorun, window, cx));
-                    cx.new(|cx| Root::new(view, window, cx))
+                    let shell = cx.new(|_| Shell { app: None });
+                    *shell_slot.borrow_mut() = Some(shell.clone());
+                    cx.new(|cx| Root::new(shell, window, cx))
                 },
             )
             .inspect_err(|e| eprintln!("optlab: failed to open window: {e:#}"))?;
+            // Build the real UI only after the first frame: on X11 gpui can miss the initial
+            // expose when the main thread is busy inside `open_window`, leaving a black window.
+            cx.background_executor().timer(std::time::Duration::from_millis(120)).await;
+            let shell = shell_slot.borrow_mut().take();
+            if let Some(shell) = shell {
+                handle.update(cx, |_, window, cx| {
+                    shell.update(cx, |sh, cx| {
+                        sh.app = Some(cx.new(|cx| OptLabApp::new(page, autorun, window, cx)));
+                        cx.notify();
+                    });
+                })?;
+            }
             Ok::<_, anyhow::Error>(())
         })
         .detach();
     });
+}
+
+
+/// Window root content: a splash until the (heavier) main view is built.
+struct Shell {
+    app: Option<gpui::Entity<OptLabApp>>,
+}
+
+impl gpui::Render for Shell {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+        use gpui::{IntoElement, ParentElement, Styled};
+        match &self.app {
+            Some(app) => app.clone().into_any_element(),
+            None => {
+                let p = theme::palette();
+                gpui::div()
+                    .size_full()
+                    .bg(p.bg)
+                    .text_color(p.muted)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child("OptLab 選擇權實驗室 · 載入中…")
+                    .into_any_element()
+            }
+        }
+    }
 }
