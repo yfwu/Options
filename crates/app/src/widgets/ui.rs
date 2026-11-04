@@ -1,7 +1,7 @@
 //! Small layout helpers in Zed's dense style: panels, KPI tiles, form fields, tables.
 
 use gpui::{
-    div, prelude::*, px, AnyElement, App, Div, Entity, Hsla, SharedString, Stateful, Window,
+    div, prelude::*, px, App, Div, Entity, Hsla, SharedString, Stateful, Window,
 };
 use gpui_component::{
     h_flex,
@@ -324,9 +324,9 @@ pub fn input_text(e: &Entity<InputState>, cx: &App) -> String {
     e.read(cx).value().trim().to_string()
 }
 
-/// Parse a float; accepts "%" suffix (divides by 100 when `pct_ok`) and thousands commas.
+/// Parse a float; accepts a "%" suffix (divides by 100) and thousands separators.
 pub fn parse_num(s: &str) -> Result<f64, String> {
-    let t = s.trim().replace(',', "").replace('_', "");
+    let t = s.trim().replace([',', '_'], "");
     if t.is_empty() {
         return Err("必填".into());
     }
@@ -435,15 +435,10 @@ pub fn parse_list(t: &str) -> Result<Vec<f64>, String> {
         }
         return Ok((0..n).map(|i| a + s * i as f64).collect());
     }
-    t.split(|c: char| c == ',' || c == ' ' || c == '，' || c == ';')
+    t.split([',', ' ', '，', ';'])
         .filter(|s| !s.trim().is_empty())
         .map(parse_num)
         .collect()
-}
-
-/// Convert any element-producing closure output into AnyElement (helper for match arms).
-pub fn any(e: impl IntoElement) -> AnyElement {
-    e.into_any_element()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -515,7 +510,7 @@ pub fn money(v: f64) -> String {
     let s = a.to_string();
     let mut out = String::new();
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);

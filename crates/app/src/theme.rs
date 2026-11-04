@@ -51,13 +51,6 @@ pub fn palette() -> Palette {
     }
 }
 
-/// Series colour cycle for charts.
-pub fn series_color(i: usize) -> Hsla {
-    let p = palette();
-    let cyc = [p.blue, p.green, p.orange, p.purple, p.cyan, p.red, p.yellow, p.muted];
-    cyc[i % cyc.len()]
-}
-
 pub const UI_FONT: &str = if cfg!(target_os = "macos") {
     "PingFang TC"
 } else if cfg!(target_os = "windows") {

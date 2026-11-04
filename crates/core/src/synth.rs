@@ -166,6 +166,55 @@ impl SynthVolModel {
         (self.long_run_vol + (short - self.long_run_vol) * w).clamp(self.min_vol, self.max_vol)
     }
 
+    /// Calibrate `long_run_vol` and `iv_scale` to an observed ATM term structure
+    /// (e.g. [`crate::surface::VolSurface::atm_term_structure`] of a live chain) given
+    /// the vol index level on the same day. Points are `(dte_days, atm_iv_decimal)`;
+    /// tenors under 14 days are ignored. Weighted least squares with weight ∝ √T so the
+    /// long end (what LEAPS backtests depend on) dominates. Returns the calibrated
+    /// model and the RMS error in vol points, or `None` with fewer than 2 usable points.
+    pub fn calibrate_term_structure(&self, points: &[(i64, f64)], vol_index_pts: f64) -> Option<(SynthVolModel, f64)> {
+        let pts: Vec<(f64, f64)> = points
+            .iter()
+            .filter(|(d, iv)| *d >= 14 && iv.is_finite() && *iv > 0.01 && *iv < 3.0)
+            .map(|(d, iv)| (*d as f64 / 365.0, *iv))
+            .collect();
+        if pts.len() < 2 || !(vol_index_pts > 0.0) {
+            return None;
+        }
+        let err = |m: &SynthVolModel| -> f64 {
+            let (mut se, mut sw) = (0.0, 0.0);
+            for &(t, iv) in &pts {
+                let w = t.sqrt();
+                se += w * (m.atm_vol(t, vol_index_pts) - iv).powi(2);
+                sw += w;
+            }
+            (se / sw).sqrt()
+        };
+        let mut best = (self.clone(), err(self));
+        // Coarse grid then two refinements: σ_LR ∈ [8%, 60%], iv_scale ∈ [0.6, 1.3].
+        let (mut lo_l, mut hi_l, mut lo_s, mut hi_s) = (0.08, 0.60, 0.60, 1.30);
+        for _ in 0..3 {
+            let n = 26;
+            for i in 0..=n {
+                for j in 0..=n {
+                    let mut m = self.clone();
+                    m.long_run_vol = lo_l + (hi_l - lo_l) * i as f64 / n as f64;
+                    m.iv_scale = lo_s + (hi_s - lo_s) * j as f64 / n as f64;
+                    let e = err(&m);
+                    if e < best.1 {
+                        best = (m, e);
+                    }
+                }
+            }
+            let (dl, ds) = ((hi_l - lo_l) / 8.0, (hi_s - lo_s) / 8.0);
+            lo_l = (best.0.long_run_vol - dl).max(0.05);
+            hi_l = best.0.long_run_vol + dl;
+            lo_s = (best.0.iv_scale - ds).max(0.3);
+            hi_s = best.0.iv_scale + ds;
+        }
+        Some((best.0, best.1 * 100.0))
+    }
+
     /// Implied vol for a given strike / spot / maturity (years) / vol-index level (points).
     #[inline]
     pub fn iv(&self, strike: f64, spot: f64, t: f64, vol_index_pts: f64) -> f64 {
@@ -538,5 +587,26 @@ mod tests {
         assert_eq!(c.without_crisis_widening().half_spread_at(100.0, 80.0), c.half_spread(100.0));
         assert_eq!(CostModel::zero().buy_price(10.0), 10.0);
         assert_eq!(c.sell_price(0.01), 0.0);
+    }
+}
+
+
+#[cfg(test)]
+mod calibration_tests {
+    use super::*;
+
+    #[test]
+    fn calibration_recovers_known_parameters() {
+        let truth = SynthVolModel { long_run_vol: 0.235, iv_scale: 0.93, ..SynthVolModel::qqq() };
+        let vix = 19.0;
+        let pts: Vec<(i64, f64)> = [7, 30, 60, 91, 182, 273, 365, 547, 730]
+            .iter()
+            .map(|&d| (d as i64, truth.atm_vol(d as f64 / 365.0, vix)))
+            .collect();
+        let (fit, rms) = SynthVolModel::qqq().calibrate_term_structure(&pts, vix).unwrap();
+        assert!(rms < 0.05, "rms {rms} vol pts");
+        assert!((fit.long_run_vol - 0.235).abs() < 0.01, "{}", fit.long_run_vol);
+        assert!((fit.iv_scale - 0.93).abs() < 0.03, "{}", fit.iv_scale);
+        assert!(SynthVolModel::qqq().calibrate_term_structure(&pts[..1], vix).is_none());
     }
 }

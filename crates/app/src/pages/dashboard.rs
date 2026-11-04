@@ -197,7 +197,7 @@ impl Render for DashboardPage {
             .child(chip("go-bt", "→ 以此標的回測", false, cx).on_click(cx.listener(|this, _, window, cx| {
                 let sym = this.current_symbol(cx);
                 let patch = crate::pages::backtest::BacktestParamsPatch { symbol: Some(sym), ..Default::default() };
-                this.state.update(cx, |_, cx| cx.emit(crate::state::AppEvent::ApplyBacktestParams(patch)));
+                this.state.update(cx, |_, cx| cx.emit(crate::state::AppEvent::ApplyBacktestParams(Box::new(patch))));
                 let _ = window;
             })))
             .child(chip("go-chain", "→ 期權鏈", false, cx).on_click(cx.listener(|this, _, _, cx| {

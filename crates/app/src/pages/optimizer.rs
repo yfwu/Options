@@ -17,7 +17,7 @@ use gpui_component::{
     v_flex, IndexPath, Sizable,
 };
 use optlab_core::backtest::{RollConfig, StrikeSelection};
-use optlab_core::optimize::{bootstrap_robustness, optimize, walk_forward, walk_forward_summary, Objective, OptRow, ParamGrid, Percentiles, RobustnessReport, WalkForwardSummary, WalkForwardWindow};
+use optlab_core::optimize::{bootstrap_robustness, optimize, optimize_robust, RobustOptions, walk_forward, walk_forward_summary, Objective, OptRow, ParamGrid, Percentiles, RobustnessReport, WalkForwardSummary, WalkForwardWindow};
 
 use crate::data_bridge;
 use crate::pages::backtest::BacktestParamsPatch;
@@ -81,6 +81,7 @@ pub struct OptimizerPage {
     symbol: Entity<SelectState<Vec<SharedString>>>,
     inp: Inputs,
     obj: Obj,
+    robust: bool,
     metric: HeatMetric,
     errors: FormErrors,
     running: bool,
@@ -140,6 +141,7 @@ impl OptimizerPage {
             symbol,
             inp,
             obj: Obj::Utility,
+            robust: true,
             metric: HeatMetric::Score,
             errors: FormErrors::default(),
             running: false,
@@ -173,10 +175,7 @@ impl OptimizerPage {
     }
 
     fn base_config(sym: &str) -> RollConfig {
-        match sym {
-            "SPY" | "VTI" => RollConfig::spy(),
-            _ => RollConfig::qqq(),
-        }
+        data_bridge::roll_config_for(sym)
     }
 
     fn build(&mut self, cx: &mut Context<Self>) -> Option<(String, RollConfig, ParamGrid, Objective)> {
@@ -238,18 +237,25 @@ impl OptimizerPage {
             st.set_status(StatusLevel::Info, format!("優化 {sym}：{total} 組參數…"), cx);
             st.begin_task(format!("優化 {sym}"), cx)
         });
-        let (d2, f2_, sym2, cancel) = (done.clone(), finished.clone(), sym.clone(), self.cancel.clone());
+        let total_seen = Arc::new(AtomicUsize::new(0));
+        let (d2, f2_, sym2, cancel, n2) = (done.clone(), finished.clone(), sym.clone(), self.cancel.clone(), total_seen.clone());
+        let robust = self.robust;
         let t0 = std::time::Instant::now();
         let job = cx.background_executor().spawn(async move {
             let res = (|| {
                 let (data, _) = data_bridge::backtest_data(&sym2, q)?;
-                let cb = move |k: usize, _n: usize| {
+                let cb = move |k: usize, n: usize| {
                     d2.store(k, Ordering::Relaxed);
+                    n2.store(n, Ordering::Relaxed);
                 };
                 if cancel.load(Ordering::Relaxed) {
                     return Err("已取消".to_string());
                 }
-                Ok(optimize(&data, &base, &grid, obj, Some(&cb)))
+                if robust {
+                    optimize_robust(&data, &base, &grid, obj, &RobustOptions::default(), Some(&cb)).map_err(|e| format!("{e:#}"))
+                } else {
+                    Ok(optimize(&data, &base, &grid, obj, Some(&cb)))
+                }
             })();
             f2_.store(true, Ordering::Relaxed);
             res
@@ -259,10 +265,14 @@ impl OptimizerPage {
             loop {
                 cx.background_executor().timer(Duration::from_millis(150)).await;
                 let k = done.load(Ordering::Relaxed);
+                let n = total_seen.load(Ordering::Relaxed);
                 let fin = finished.load(Ordering::Relaxed);
                 if this
                     .update(cx, |this, cx| {
                         this.progress.0 = k;
+                        if n > 0 {
+                            this.progress.1 = n;
+                        }
                         cx.notify();
                     })
                     .is_err()
@@ -285,7 +295,7 @@ impl OptimizerPage {
                             "優化完成 {} 組 · {:.1}s · 最佳 {} → CAGR {} / MaxDD {}",
                             rows.len(),
                             t0.elapsed().as_secs_f32(),
-                            best.config.label(),
+                            best.label(),
                             pct(best.stats.cagr),
                             pct(best.stats.max_drawdown)
                         );
@@ -373,6 +383,7 @@ impl OptimizerPage {
             return;
         };
         let cfg = row.config.clone();
+        let label = row.label();
         let mut e = FormErrors::default();
         let n = e.int("boot_n", &self.inp.boot_n, 10, 5000, cx) as usize;
         let block = e.num_range("boot_block", &self.inp.boot_block, 1.0, 1000.0, cx);
@@ -384,7 +395,6 @@ impl OptimizerPage {
         let sym = self.run_symbol.clone();
         let q = data_bridge::default_dividend_yield(&sym);
         self.boot_running = true;
-        let label = cfg.label();
         let task = self.state.update(cx, |st, cx| st.begin_task(format!("拔靴 {n} 次"), cx));
         let job = cx.background_executor().spawn(async move {
             let (data, _) = data_bridge::backtest_data(&sym, q)?;
@@ -481,7 +491,7 @@ impl OptimizerPage {
     fn load_into_backtest(&mut self, i: usize, cx: &mut Context<Self>) {
         let Some(r) = self.rows.get(i) else { return };
         let patch = BacktestParamsPatch { symbol: Some(self.run_symbol.clone()), config: Some(r.config.clone()), run: true };
-        self.state.update(cx, |_, cx| cx.emit(AppEvent::ApplyBacktestParams(patch)));
+        self.state.update(cx, |_, cx| cx.emit(AppEvent::ApplyBacktestParams(Box::new(patch))));
     }
 
     fn render_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -514,6 +524,19 @@ impl OptimizerPage {
             .child(row().child(f("目標曝險 x", "exposure", &i.exposure)).child(f("Roll-up Δ (無=不用)", "roll_up", &i.roll_up)))
             .child(row().child(f("最短持有天數", "min_hold", &i.min_hold)).child(f("顯示前 N 名", "top_n", &i.top_n)))
             .child(muted_text(format!("組合數：{}", combos.map(|n| n.to_string()).unwrap_or_else(|| "—".into())), cx))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(chip("robust-on", "穩健優化（拔靴中位數）", self.robust, cx).on_click(cx.listener(|this, _, _, cx| {
+                        this.robust = true;
+                        cx.notify();
+                    })))
+                    .child(chip("robust-off", "僅歷史路徑", !self.robust, cx).on_click(cx.listener(|this, _, _, cx| {
+                        this.robust = false;
+                        cx.notify();
+                    }))),
+            )
+            .child(muted_text(if self.robust { "穩健模式：每組參數在 12 條區塊拔靴合成歷史 + 真實歷史上評分，取中位數並與相鄰格平滑，降低過度擬合。" } else { "僅以單一真實歷史評分（較快，但容易過度擬合）。" }, cx))
             .child(section_title("目標函數 Objective", cx))
             .child(h_flex().gap_1().flex_wrap().children(Obj::ALL.iter().map(|o| {
                 let o = *o;
@@ -562,6 +585,7 @@ impl OptimizerPage {
             Col::new("Calmar", 56.0),
             Col::new("分數", 64.0),
             Col::new("滾動數", 56.0),
+            Col::new("最低權益", 66.0),
             Col::new("成本", 76.0),
             Col::new("", 70.0).center(),
         ];
@@ -591,8 +615,9 @@ impl OptimizerPage {
                         Cell::new(f2(r.stats.calmar)),
                         Cell::new(format!("{:.3}", r.score)).color(p.yellow),
                         Cell::new(r.n_rolls.to_string()),
+                        Cell::new(pct(r.min_equity_ratio)).color(if r.near_wipe { p.red } else { p.muted }),
                         Cell::new(money(r.total_costs)).color(p.muted),
-                        Cell::new(if r.wiped_out { "歸零" } else { "→ 回測" }).color(if r.wiped_out { p.red } else { p.blue }),
+                        Cell::new(if r.wiped_out { "歸零" } else if r.near_wipe { "近乎歸零" } else { "→ 回測" }).color(if r.near_wipe { p.red } else { p.blue }),
                     ],
                     i % 2 == 1,
                     cx,
@@ -638,7 +663,9 @@ impl OptimizerPage {
                                     .child(prow("b4", "買進持有 CAGR", &r.bh_cagr, pct, true))
                                     .child(prow("b5", "買進持有 MaxDD", &r.bh_max_dd, pct, false))
                                     .child(prow("b6", "槓桿ETF CAGR", &r.lev_cagr, pct, true))
-                                    .child(prow("b7", "槓桿ETF MaxDD", &r.lev_max_dd, pct, false)),
+                                    .child(prow("b7", "槓桿ETF MaxDD", &r.lev_max_dd, pct, false))
+                                    .child(prow("b8", "曝險配對線性 CAGR", &r.matched_cagr, pct, true))
+                                    .child(prow("b9", "最低權益/初始", &r.min_equity, pct, false)),
                             )
                             .child(
                                 h_flex()
@@ -648,7 +675,9 @@ impl OptimizerPage {
                                     .child(kpi("勝過買進持有", pct(r.prob_beat_benchmark), Some(p.green), cx))
                                     .child(kpi("勝過槓桿ETF", pct(r.prob_beat_lev_etf), Some(p.orange), cx))
                                     .child(kpi("虧損機率", pct(r.prob_loss), None, cx))
-                                    .child(kpi("回撤 > 50%", pct(r.prob_dd_over_50), None, cx)),
+                                    .child(kpi("回撤 > 50%", pct(r.prob_dd_over_50), None, cx))
+                                    .child(kpi("近乎歸零機率", pct(r.prob_near_wipe), Some(p.red), cx))
+                                    .child(kpi("勝過曝險配對線性", pct(r.prob_beat_matched), Some(p.cyan), cx)),
                             ),
                     )
                     .child(div().flex_1().min_w(px(240.0)).h(px(250.0)).child(xy_chart(spec.clone()))),
@@ -749,7 +778,8 @@ impl OptimizerPage {
                         d.child(
                             panel("選定參數", cx).w(px(260.0)).flex_none().child(
                                 panel_body()
-                                    .child(kv("參數", r.config.label(), cx))
+                                    .child(kv("參數", r.label(), cx))
+                                    .child(kv_colored("最低權益/初始", pct(r.min_equity_ratio), if r.near_wipe { p.red } else { p.text }, cx))
                                     .child(kv_colored("CAGR", pct2(r.stats.cagr), sign_color(r.stats.cagr), cx))
                                     .child(kv_colored("MaxDD", pct(r.stats.max_drawdown), p.red, cx))
                                     .child(kv("Sharpe / Sortino", format!("{} / {}", f2(r.stats.sharpe), f2(r.stats.sortino)), cx))

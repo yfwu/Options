@@ -54,6 +54,18 @@ struct RollArgs {
     /// Whole contracts only (realistic for small accounts).
     #[arg(long)]
     integer: bool,
+    /// Long-run ATM IV of the synthetic vol model (e.g. from `optlab chain --calibrate`).
+    #[arg(long)]
+    lr_vol: Option<f64>,
+    /// Short-dated ATM IV / vol index ratio of the synthetic vol model.
+    #[arg(long)]
+    iv_scale: Option<f64>,
+    /// Execution lag in trading days (signal at close t, fill at close t+lag).
+    #[arg(long)]
+    lag: Option<u32>,
+    /// Use the conservative cost model (wider spreads, slippage, stronger crisis widening).
+    #[arg(long)]
+    conservative: bool,
     /// Start date YYYY-MM-DD.
     #[arg(long)]
     start: Option<NaiveDate>,
@@ -73,6 +85,18 @@ impl RollArgs {
         c.roll_up_delta = self.roll_up;
         if let Some(h) = self.half_spread {
             c.costs.half_spread_pct = h;
+        }
+        if let Some(v) = self.lr_vol {
+            c.vol_model.long_run_vol = v;
+        }
+        if let Some(v) = self.iv_scale {
+            c.vol_model.iv_scale = v;
+        }
+        if let Some(l) = self.lag {
+            c.exec_lag_days = l;
+        }
+        if self.conservative {
+            c.costs = optlab_core::synth::CostModel::conservative();
         }
         c.initial_capital = self.capital;
         c.integer_contracts = self.integer;
@@ -508,6 +532,23 @@ fn main() -> Result<()> {
             println!("GEX 總量 ${:.0}/1%  Gamma 翻轉點 {:?}", a.gex.total_gex, a.gex.gamma_flip);
             for (e, s) in a.skew_25d.iter().take(6) {
                 println!("  25Δ skew {e}: {:.2} vol pts", s * 100.0);
+            }
+            // Calibrate the backtest's synthetic vol model to this chain's ATM term structure.
+            let vname = bundled::default_vol_index_name(&chain.underlying);
+            if let Ok(vs) = svc.fetch_vol_index(vname) {
+                if let Some((d, v)) = vs.last() {
+                    let base = presets::vol_model_for(&chain.underlying);
+                    match base.calibrate_term_structure(&a.term_structure, v) {
+                        Some((m, rms)) => println!(
+                            "合成波動模型校準（{vname} {v:.2} @ {d}）：long_run_vol {:.3}（預設 {:.3}）  iv_scale {:.3}（預設 {:.3}）  RMS {rms:.2} vol 點\n  → 回測可用：optlab backtest --symbol {} --lr-vol {:.3} --iv-scale {:.3}",
+                            m.long_run_vol, base.long_run_vol, m.iv_scale, base.iv_scale, chain.underlying, m.long_run_vol, m.iv_scale
+                        ),
+                        None => println!("期限結構點數不足，無法校準合成波動模型"),
+                    }
+                    if (d - chain.as_of.date()).num_days().abs() > 5 {
+                        println!("  ⚠ 波動指數日期 {d} 與期權鏈日期 {} 不同，校準僅供參考", chain.as_of.date());
+                    }
+                }
             }
             if let Some(key) = strategy {
                 let t = StrategyTemplate::from_key(&key).with_context(|| format!("unknown template {key}"))?;

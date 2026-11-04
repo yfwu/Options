@@ -4,7 +4,6 @@
 use gpui::{div, prelude::*, px, Context, Entity, SharedString, Window};
 use gpui_component::{h_flex, v_flex, ActiveTheme};
 use optlab_core::advisor::{advise, leaps_carry_table, strategy_conclusions, stress_test, Advice, CarryRow, MarketSnapshot, StressRow};
-use optlab_core::backtest::RollConfig;
 use optlab_core::strategy::ALL_TEMPLATES;
 
 use crate::data_bridge;
@@ -55,7 +54,8 @@ impl GuidePage {
         let model = data_bridge::vol_model_for(&sym);
         self.snap_label = format!("{sym} {} · 收盤 {spot:.2} · {vname} {:.1} · r {:.2}%", snap.date, snap.vol_now, r * 100.0);
         self.carry = leaps_carry_table(&model, spot, snap.vol_now, r, q, &[0.6, 0.7, 0.8, 0.9], &[180, 365, 540, 730]);
-        let cfg = RollConfig { vol_model: model, ..if sym == "SPY" { RollConfig::spy() } else { RollConfig::qqq() } };
+        let cfg = data_bridge::roll_config_for(&sym);
+        let _ = &model;
         self.stress_label = format!("{} · {}", sym, cfg.label());
         let scen = [(0.10, snap.vol_now * 1.3, 10), (0.20, snap.vol_now * 1.7, 30), (0.35, snap.vol_now * 2.2, 60), (0.50, snap.vol_now * 2.5, 180)];
         self.stress = stress_test(&cfg, spot, snap.vol_now, r, q, &scen);

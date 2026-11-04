@@ -5,12 +5,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, Weekday};
-use optlab_core::backtest::{approx_us_tbill_rates, BacktestData, RateSource};
+use optlab_core::backtest::{BacktestData, RollConfig};
 use optlab_core::pricing::{bs_greeks, year_frac};
 use optlab_core::strategy::{strike_step, third_friday};
 use optlab_core::synth::SynthVolModel;
 use optlab_core::{ExerciseStyle, OptionChain, OptionKind, OptionQuote, PriceSeries, ScalarSeries};
-use optlab_data::{bundled, Config, DataService, Provider, Store};
+use optlab_data::{bundled, presets, Config, DataService, Provider, Store};
 use serde::{Deserialize, Serialize};
 
 /// Settings edited on the 設定 page: a superset of `optlab_data::Config`.
@@ -85,56 +85,30 @@ pub fn bundled_prices(symbol: &str) -> Result<PriceSeries, String> {
     bundled::prices(symbol).ok_or_else(|| format!("沒有 {symbol} 的內建歷史價格"))
 }
 
-pub fn bundled_vol_index(name: &str) -> Result<ScalarSeries, String> {
-    bundled::vol_index(name).ok_or_else(|| format!("沒有 {name} 的內建波動率指數"))
-}
-
 /// The natural vol index for an underlying (VXN with VIX proxy back-fill for Nasdaq names).
 pub fn default_vol_for(symbol: &str) -> Result<(String, ScalarSeries), String> {
     let name = bundled::default_vol_index_name(symbol).to_string();
     bundled::default_vol_index_for(symbol).map(|s| (name.clone(), s)).ok_or_else(|| format!("沒有 {name} 內建資料"))
 }
 
-/// Risk-free rate history for backtests: bundled DGS3MO spliced onto the approximate
-/// 1990+ T-bill table for early dates.
-pub fn rate_source() -> RateSource {
-    let approx = approx_us_tbill_rates();
-    match bundled::rate("DGS3MO") {
-        Some(r) if !r.is_empty() => {
-            let first = r.points[0].0;
-            let mut pts: Vec<(NaiveDate, f64)> = approx.points.iter().copied().filter(|(d, _)| *d < first).collect();
-            pts.extend(r.points.iter().copied());
-            RateSource::Series(ScalarSeries::new("3M T-bill", pts))
-        }
-        _ => RateSource::Series(approx),
-    }
-}
-
 pub fn default_dividend_yield(symbol: &str) -> f64 {
-    match symbol.to_ascii_uppercase().as_str() {
-        "SPY" | "VTI" | "SPX" => 0.014,
-        "QQQ" | "NDX" => 0.006,
-        "MSFT" => 0.008,
-        "AVGO" => 0.013,
-        "TSM" => 0.015,
-        "SOXX" => 0.007,
-        _ => 0.0,
-    }
+    presets::default_dividend_yield(symbol)
 }
 
-/// Assemble backtest inputs from bundled data.
+/// Assemble backtest inputs from bundled data (`q` overrides the preset dividend yield).
 pub fn backtest_data(symbol: &str, q: f64) -> Result<(BacktestData, String), String> {
-    let prices = bundled_prices(symbol)?;
-    let (vname, vol) = default_vol_for(symbol)?;
-    Ok((BacktestData::new(prices, vol, rate_source(), q), vname))
+    let (mut data, vname) = presets::backtest_data(symbol).map_err(|e| format!("{e:#}"))?;
+    data.dividend_yield = q;
+    Ok((data, vname))
 }
 
 pub fn vol_model_for(symbol: &str) -> SynthVolModel {
-    if bundled::default_vol_index_name(symbol) == "VXN" {
-        SynthVolModel::qqq()
-    } else {
-        SynthVolModel::spy()
-    }
+    presets::vol_model_for(symbol)
+}
+
+/// Default roll config calibrated for an underlying (vol surface + costs).
+pub fn roll_config_for(symbol: &str) -> RollConfig {
+    presets::roll_config_for(symbol)
 }
 
 /// Provider choices of the chain page.

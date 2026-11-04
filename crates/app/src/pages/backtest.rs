@@ -51,6 +51,9 @@ struct Inputs {
     rate_spread: Entity<InputState>,
     lev_spread: Entity<InputState>,
     lev_er: Entity<InputState>,
+    exec_lag: Entity<InputState>,
+    crisis_ref: Entity<InputState>,
+    crisis_exp: Entity<InputState>,
 }
 
 pub struct BacktestPage {
@@ -114,6 +117,9 @@ impl BacktestPage {
             rate_spread: i(format!("{}", cfg.option_rate_spread * 100.0), window, cx),
             lev_spread: i(format!("{}", cfg.lev_borrow_spread * 100.0), window, cx),
             lev_er: i(format!("{}", cfg.lev_expense_ratio * 100.0), window, cx),
+            exec_lag: i(cfg.exec_lag_days.to_string(), window, cx),
+            crisis_ref: i(format!("{}", cfg.costs.crisis_ref_vol), window, cx),
+            crisis_exp: i(format!("{}", cfg.costs.crisis_exp), window, cx),
         };
         let subs = vec![cx.subscribe_in(&symbol, window, |this, _, ev: &SelectEvent<Vec<SharedString>>, window, cx| {
             let SelectEvent::Confirm(Some(v)) = ev else { return };
@@ -142,10 +148,7 @@ impl BacktestPage {
     }
 
     fn default_config(sym: &str) -> RollConfig {
-        match sym.to_ascii_uppercase().as_str() {
-            "SPY" | "VTI" => RollConfig::spy(),
-            _ => RollConfig::qqq(),
-        }
+        data_bridge::roll_config_for(sym)
     }
 
     fn set_costs(&mut self, cfg: &RollConfig, window: &mut Window, cx: &mut Context<Self>) {
@@ -196,6 +199,9 @@ impl BacktestPage {
             set(&self.inp.end, c.end.map(|d| d.to_string()).unwrap_or_default(), window, cx);
             self.set_costs(c, window, cx);
             set(&self.inp.rate_spread, format!("{}", c.option_rate_spread * 100.0), window, cx);
+            set(&self.inp.exec_lag, c.exec_lag_days.to_string(), window, cx);
+            set(&self.inp.crisis_ref, format!("{}", c.costs.crisis_ref_vol), window, cx);
+            set(&self.inp.crisis_exp, format!("{}", c.costs.crisis_exp), window, cx);
             self.integer = c.integer_contracts;
             self.cash_yield = c.cash_yield;
         }
@@ -247,6 +253,9 @@ impl BacktestPage {
         cfg.option_rate_spread = e.num_range("rate_spread", &i.rate_spread, -5.0, 10.0, cx) / 100.0;
         cfg.lev_borrow_spread = e.num_range("lev_spread", &i.lev_spread, -5.0, 20.0, cx) / 100.0;
         cfg.lev_expense_ratio = e.num_range("lev_er", &i.lev_er, 0.0, 10.0, cx) / 100.0;
+        cfg.exec_lag_days = e.int("exec_lag", &i.exec_lag, 0, 20, cx) as u32;
+        cfg.costs.crisis_ref_vol = e.num_range("crisis_ref", &i.crisis_ref, 0.0, 200.0, cx);
+        cfg.costs.crisis_exp = e.num_range("crisis_exp", &i.crisis_exp, 0.0, 5.0, cx);
         cfg.integer_contracts = self.integer;
         cfg.cash_yield = self.cash_yield;
         if let (Some(a), Some(b)) = (cfg.start, cfg.end) {
@@ -295,7 +304,7 @@ impl BacktestPage {
                             res.trades.len(),
                             t0.elapsed().as_secs_f32()
                         );
-                        let lvl = if res.wiped_out { StatusLevel::Warn } else { StatusLevel::Ok };
+                        let lvl = if res.near_wipe { StatusLevel::Warn } else { StatusLevel::Ok };
                         this.state.update(cx, |st, cx| st.set_status(lvl, msg, cx));
                         this.charts = Some(Self::make_charts(&res));
                         this.result = Some(Arc::new(res));
@@ -320,7 +329,11 @@ impl BacktestPage {
         let mut equity = ChartSpec::new().dates().y_fmt(fmt_money).series(Series::line("LEAPS 滾動", eq.clone(), colors[0]).width(1.8));
         for (i, (name, c)) in res.benchmarks.iter().enumerate() {
             let pts = c.iter().map(|(d, v)| (date_to_x(*d), *v)).collect();
-            equity = equity.series(Series::line(name.clone(), pts, colors[(i + 1) % colors.len()]).width(1.1));
+            let mut sr = Series::line(name.clone(), pts, colors[(i + 1) % colors.len()]).width(1.1);
+            if i >= 2 {
+                sr = sr.dashed();
+            }
+            equity = equity.series(sr);
         }
         equity = equity.hline(RefLine::new(res.config.initial_capital, p.dim).label("初始資金"));
         let equity_log = Rc::new(equity.clone().log_y(true));
@@ -404,6 +417,8 @@ impl BacktestPage {
             .child(row().child(f("半價差 %", "half_spread", &i.half_spread)).child(f("手續費 $/口", "commission", &i.commission)).child(f("滑價 %", "slippage", &i.slippage)))
             .child(row().child(f("股息率 q %", "q", &i.q)).child(f("波動模型倍數", "vol_scale", &i.vol_scale)).child(f("選擇權利差 %", "rate_spread", &i.rate_spread)))
             .child(row().child(f("槓桿ETF 借貸利差 %", "lev_spread", &i.lev_spread)).child(f("槓桿ETF 費用率 %", "lev_er", &i.lev_er)))
+            .child(section_title("進階 Advanced", cx))
+            .child(row().child(f("執行延遲 (交易日)", "exec_lag", &i.exec_lag)).child(f("危機價差門檻", "crisis_ref", &i.crisis_ref)).child(f("危機價差指數", "crisis_exp", &i.crisis_exp)))
             .child(
                 Button::new("run-bt")
                     .primary()
@@ -413,6 +428,7 @@ impl BacktestPage {
                     .on_click(cx.listener(|this, _, window, cx| this.run(window, cx))),
             )
             .when(!self.errors.is_empty(), |d| d.child(div().text_size(px(11.0)).text_color(palette().red).child(self.errors.summary())))
+            .child(muted_text("危機價差：波動率指數高於門檻 (0 = 關閉) 時，半價差 × (vol/門檻)^指數。執行延遲 1 = 收盤看到訊號、次日收盤成交。", cx))
             .child(muted_text(
                 "說明：以內建歷史價格 + 波動率指數 (VXN/VIX) 驅動的偏斜 IV 曲面合成 LEAPS 價格；利率使用 3M 國庫券歷史。基準：買進持有與每日再平衡 L 倍槓桿 ETF。",
                 cx,
@@ -554,8 +570,9 @@ impl BacktestPage {
             .child(kpi("槓桿ETF CAGR", pct2(lev.cagr), Some(p.orange), cx))
             .child(kpi("最大回撤", pct(s.max_drawdown), Some(p.red), cx))
             .child(kpi("Sharpe / Sortino", format!("{} / {}", f2(s.sharpe), f2(s.sortino)), None, cx))
-            .child(kpi("平均曝險", format!("{:.2}x", res.avg_exposure), None, cx))
-            .child(kpi("滾動次數 / 年", format!("{} / {:.1}", res.n_rolls, res.n_rolls as f64 / years.max(0.1)), None, cx));
+
+            .child(kpi("最低權益", pct(res.min_equity_ratio), Some(if res.near_wipe { p.red } else { p.text }), cx))
+            .child(kpi("曝險 · 滾動/年", format!("{:.2}x · {:.1}", res.avg_exposure, res.n_rolls as f64 / years.max(0.1)), None, cx));
         let extra = panel("持有成本分析 Carry", cx).flex_1().min_w(px(260.0)).child(
             panel_body()
                 .child(kv("期間", format!("{} → {} ({:.1} 年)", s.start, s.end, years), cx))
@@ -566,7 +583,9 @@ impl BacktestPage {
                 .child(kv("交易成本總額", money(res.total_costs), cx))
                 .child(kv("成本拖累 / 年", pct2(res.cost_drag_annual), cx))
                 .child(kv("平均無風險利率", pct2(res.avg_rate), cx))
-                .child(kv("參數", res.config.label(), cx))
+                .child(kv("參數 / 結果", res.label(), cx))
+                .child(kv_colored("最低權益 / 初始", pct(res.min_equity_ratio), if res.near_wipe { p.red } else { p.text }, cx))
+                .when(res.near_wipe && !res.wiped_out, |d| d.child(badge(format!("⚠ 近乎歸零：最低權益僅剩初始的 {}", pct(res.min_equity_ratio)), p.red)))
                 .when(res.wiped_out, |d| {
                     d.child(badge(format!("⚠ 帳戶歸零於 {}", res.wiped_date.map(|d| d.to_string()).unwrap_or_default()), p.red))
                 }),
@@ -577,7 +596,7 @@ impl BacktestPage {
             .child(kpis)
             .child(
                 panel_with(
-                    format!("{} 權益曲線 vs 基準", self.result_symbol),
+                    format!("{} 權益曲線 vs 基準 · {}", self.result_symbol, res.label()),
                     chip("bt-log", "對數座標", self.log, cx).on_click(cx.listener(|this, _, _, cx| {
                         this.log = !this.log;
                         cx.notify();
@@ -598,6 +617,7 @@ impl BacktestPage {
                 h_flex()
                     .gap_2()
                     .items_start()
+                    .flex_wrap()
                     .child(panel("績效統計 (vs 基準)", cx).flex_none().child(self.stats_table(&res, cx)))
                     .child(extra),
             )

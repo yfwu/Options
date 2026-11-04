@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{Context, EventEmitter, SharedString};
-use optlab_core::{OptionChain, PriceSeries, ScalarSeries};
+use optlab_core::{OptionChain, PriceSeries};
 
 use crate::data_bridge::{self, Settings};
 
@@ -97,7 +97,7 @@ pub enum AppEvent {
     Navigate(Page),
     ChainChanged,
     /// Optimiser → backtest: apply these parameters (delta, entry DTE, roll DTE, exposure...).
-    ApplyBacktestParams(crate::pages::backtest::BacktestParamsPatch),
+    ApplyBacktestParams(Box<crate::pages::backtest::BacktestParamsPatch>),
     SettingsChanged,
 }
 
@@ -110,7 +110,6 @@ pub struct AppState {
     pub settings: Settings,
     pub svc: Arc<optlab_data::DataService>,
     prices: HashMap<String, Arc<PriceSeries>>,
-    vols: HashMap<String, Arc<ScalarSeries>>,
 }
 
 impl EventEmitter<AppEvent> for AppState {}
@@ -128,7 +127,6 @@ impl AppState {
             settings,
             svc,
             prices: HashMap::new(),
-            vols: HashMap::new(),
         }
     }
 
@@ -180,16 +178,6 @@ impl AppState {
         cx.notify();
     }
 
-    /// Bundled volatility index (VIX / VXN ...).
-    pub fn vol_index(&mut self, name: &str) -> Result<Arc<ScalarSeries>, String> {
-        let key = name.to_ascii_uppercase();
-        if let Some(s) = self.vols.get(&key) {
-            return Ok(s.clone());
-        }
-        let s = Arc::new(data_bridge::bundled_vol_index(&key)?);
-        self.vols.insert(key, s.clone());
-        Ok(s)
-    }
 }
 
 impl Default for AppState {

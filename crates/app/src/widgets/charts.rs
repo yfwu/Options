@@ -207,17 +207,8 @@ impl ChartSpec {
         self.include_zero = true;
         self
     }
-    pub fn y_range(mut self, lo: Option<f64>, hi: Option<f64>) -> Self {
-        self.y_min = lo;
-        self.y_max = hi;
-        self
-    }
     pub fn no_legend(mut self) -> Self {
         self.legend = false;
-        self
-    }
-    pub fn empty_text(mut self, t: impl Into<SharedString>) -> Self {
-        self.empty_text = t.into();
         self
     }
     pub fn into_rc(self) -> Rc<ChartSpec> {
@@ -264,16 +255,8 @@ pub fn fmt_auto(v: f64) -> String {
     }
 }
 
-pub fn fmt_int(v: f64) -> String {
-    format!("{:.0}", v)
-}
-
 pub fn fmt_pct(v: f64) -> String {
     format!("{:.0}%", v * 100.0)
-}
-
-pub fn fmt_pct1(v: f64) -> String {
-    format!("{:.1}%", v * 100.0)
 }
 
 pub fn fmt_money(v: f64) -> String {
