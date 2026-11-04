@@ -1,0 +1,15 @@
+[package]
+name = "optlab-core"
+description = "Option pricing, strategy analysis, LEAPS roll backtesting and optimisation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+rayon.workspace = true
