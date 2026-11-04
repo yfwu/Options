@@ -79,8 +79,10 @@ pub fn parse_date(s: &str) -> Option<NaiveDate> {
         "%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%d-%b-%Y", "%d-%b-%y",
         "%b %d %Y", "%b %d, %Y", "%B %d, %Y", "%B %d %Y", "%d %b %Y", "%d %b %y", "%d.%m.%Y", "%Y.%m.%d",
     ];
+    // `%Y` happily accepts "24" as year 24, so reject implausible years and keep trying.
+    let plausible = |d: &NaiveDate| (1900..=2200).contains(&d.year());
     for f in FMTS {
-        if let Ok(d) = NaiveDate::parse_from_str(t, f) {
+        if let Some(d) = NaiveDate::parse_from_str(t, f).ok().filter(plausible) {
             return Some(d);
         }
     }
@@ -88,7 +90,7 @@ pub fn parse_date(s: &str) -> Option<NaiveDate> {
     let titled = title_case_months(t);
     if titled != t {
         for f in FMTS {
-            if let Ok(d) = NaiveDate::parse_from_str(&titled, f) {
+            if let Some(d) = NaiveDate::parse_from_str(&titled, f).ok().filter(plausible) {
                 return Some(d);
             }
         }
@@ -149,7 +151,7 @@ mod tests {
     fn dates() {
         let d = NaiveDate::from_ymd_opt(2024, 9, 20).unwrap();
         for s in ["2024-09-20", "2024/09/20", "20240920", "09/20/2024", "9/20/2024", "20-Sep-2024", "Sep 20 2024",
-            "Sep 20, 2024", "20 SEP 24", "2024-09-20T16:00:00Z", "2024-09-20 00:00:00-04:00"] {
+            "Sep 20, 2024", "20 SEP 24", "9/20/24", "2024-09-20T16:00:00Z", "2024-09-20 00:00:00-04:00"] {
             assert_eq!(parse_date(s), Some(d), "{s}");
         }
         assert_eq!(parse_date("garbage"), None);

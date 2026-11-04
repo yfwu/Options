@@ -32,7 +32,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::chain::OptionKind;
-use crate::pricing::{bs_greeks, bs_price, strike_for_delta, Greeks};
+use crate::pricing::{bs_greeks, strike_for_delta, Greeks};
 
 /// Upside (x > 0) skew slope as a fraction of `skew_slope`: equity call wings are flatter.
 pub const CALL_WING_FACTOR: f64 = 0.5;
@@ -124,19 +124,22 @@ impl SynthVolModel {
     }
 
     /// Model mid price.
+    #[allow(clippy::too_many_arguments)]
     pub fn price(&self, kind: OptionKind, spot: f64, strike: f64, t: f64, r: f64, q: f64, vol_index_pts: f64) -> f64 {
-        let v = self.iv(strike, spot, t, vol_index_pts);
-        bs_price(kind, spot, strike, t, r, q, v)
+        self.greeks(kind, spot, strike, t, r, q, vol_index_pts).0.price
     }
 
-    /// Model Greeks (BS at the surface IV) and the IV used.
+    /// Model Greeks (BS at the surface IV, via [`fast_bs_greeks`]) and the IV used.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn greeks(&self, kind: OptionKind, spot: f64, strike: f64, t: f64, r: f64, q: f64, vol_index_pts: f64) -> (Greeks, f64) {
         let v = self.iv(strike, spot, t, vol_index_pts);
-        (bs_greeks(kind, spot, strike, t, r, q, v), v)
+        (fast_bs_greeks(kind, spot, strike, t, r, q, v), v)
     }
 
     /// Strike whose delta (at the surface IV of that strike) equals `target_delta`.
     /// Fixed-point iteration on the skewed IV; converges in a handful of steps.
+    #[allow(clippy::too_many_arguments)]
     pub fn strike_for_delta(&self, kind: OptionKind, target_delta: f64, spot: f64, t: f64, r: f64, q: f64, vol_index_pts: f64) -> f64 {
         let mut v = self.atm_vol(t, vol_index_pts);
         let mut k = strike_for_delta(kind, target_delta, spot, t, r, q, v);
@@ -150,6 +153,82 @@ impl SynthVolModel {
             k = strike_for_delta(kind, target_delta, spot, t, r, q, v);
         }
         k
+    }
+}
+
+/// Fast standard normal CDF (Hart 1968 / West 2005 double-precision algorithm,
+/// absolute error ≈ 1e-14). Used in the backtest hot loop instead of the
+/// high-precision but iterative `pricing::norm_cdf`.
+#[inline]
+pub fn fast_norm_cdf(x: f64) -> f64 {
+    let xa = x.abs();
+    let c = if xa > 37.0 {
+        0.0
+    } else {
+        let e = (-0.5 * xa * xa).exp();
+        if xa < 7.071_067_811_865_47 {
+            let mut n = 3.526_249_659_989_11e-2 * xa + 0.700_383_064_443_688;
+            n = n * xa + 6.373_962_203_531_65;
+            n = n * xa + 33.912_866_078_383;
+            n = n * xa + 112.079_291_497_871;
+            n = n * xa + 221.213_596_169_931;
+            n = n * xa + 220.206_867_912_376;
+            let mut d = 8.838_834_764_831_84e-2 * xa + 1.755_667_163_182_64;
+            d = d * xa + 16.064_177_579_207;
+            d = d * xa + 86.780_732_202_946_1;
+            d = d * xa + 296.564_248_779_674;
+            d = d * xa + 637.333_633_378_831;
+            d = d * xa + 793.826_512_519_948;
+            d = d * xa + 440.413_735_824_752;
+            e * n / d
+        } else {
+            let mut b = xa + 0.65;
+            b = xa + 4.0 / b;
+            b = xa + 3.0 / b;
+            b = xa + 2.0 / b;
+            b = xa + 1.0 / b;
+            e / b / 2.506_628_274_631
+        }
+    };
+    if x > 0.0 {
+        1.0 - c
+    } else {
+        c
+    }
+}
+
+/// Black-Scholes-Merton Greeks with the same conventions as `pricing::bs_greeks`
+/// (theta per calendar day, vega/rho per 1 point) but using [`fast_norm_cdf`].
+#[inline]
+pub fn fast_bs_greeks(kind: OptionKind, s: f64, k: f64, t: f64, r: f64, q: f64, sigma: f64) -> Greeks {
+    if t <= 0.0 || sigma <= 0.0 || s <= 0.0 || k <= 0.0 {
+        return bs_greeks(kind, s, k, t, r, q, sigma);
+    }
+    let sqrt_t = t.sqrt();
+    let vs = sigma * sqrt_t;
+    let d1 = ((s / k).ln() + (r - q + 0.5 * sigma * sigma) * t) / vs;
+    let d2 = d1 - vs;
+    let dq = (-q * t).exp();
+    let dr = (-r * t).exp();
+    let pdf = (-0.5 * d1 * d1).exp() * 0.398_942_280_401_432_7;
+    let gamma = dq * pdf / (s * vs);
+    let vega = s * dq * pdf * sqrt_t * 0.01;
+    let decay = -s * dq * pdf * sigma / (2.0 * sqrt_t);
+    match kind {
+        OptionKind::Call => {
+            let n1 = fast_norm_cdf(d1);
+            let n2 = fast_norm_cdf(d2);
+            let price = s * dq * n1 - k * dr * n2;
+            let theta = decay - r * k * dr * n2 + q * s * dq * n1;
+            Greeks { price, delta: dq * n1, gamma, theta: theta / 365.0, vega, rho: k * t * dr * n2 * 0.01 }
+        }
+        OptionKind::Put => {
+            let n1 = fast_norm_cdf(-d1);
+            let n2 = fast_norm_cdf(-d2);
+            let price = k * dr * n2 - s * dq * n1;
+            let theta = decay + r * k * dr * n2 - q * s * dq * n1;
+            Greeks { price, delta: -dq * n1, gamma, theta: theta / 365.0, vega, rho: -k * t * dr * n2 * 0.01 }
+        }
     }
 }
 
@@ -264,6 +343,29 @@ mod tests {
         let p = m.price(OptionKind::Call, s, k, t, r, q, 17.0);
         let ext = (p - (s - k).max(0.0)) / s / t;
         assert!(ext > 0.03 && ext < 0.08, "extrinsic/yr = {ext}");
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)]
+    fn fast_greeks_match_reference() {
+        // reference values: 0.5·erfc(−x/√2) in IEEE double (Python math.erfc)
+        for (x, want) in [(-0.8, 0.21185539858339669), (-0.75, 0.22662735237686821), (-1.0, 0.15865525393145707), (-2.0, 0.02275013194817922), (0.3, 0.61791142218895256), (-8.0, 6.22096057427178e-16)] {
+            let got = fast_norm_cdf(x);
+            assert!((got - want).abs() < 1e-14 * want.max(1e-2), "x={x}: {got} vs {want}");
+            assert!((fast_norm_cdf(-x) - (1.0 - want)).abs() < 1e-14);
+        }
+        for kind in [OptionKind::Call, OptionKind::Put] {
+            for &k in &[50.0, 80.0, 100.0, 120.0, 200.0] {
+                for &t in &[0.02, 0.5, 1.5, 3.0] {
+                    let a = fast_bs_greeks(kind, 100.0, k, t, 0.04, 0.012, 0.23);
+                    let b = bs_greeks(kind, 100.0, k, t, 0.04, 0.012, 0.23);
+                    for (x, y) in [(a.price, b.price), (a.delta, b.delta), (a.gamma, b.gamma), (a.theta, b.theta), (a.vega, b.vega), (a.rho, b.rho)] {
+                        // pricing::norm_cdf has ~1e-11 error near |x|≈0.75
+                        assert!((x - y).abs() < 1e-8, "{kind:?} k={k} t={t}: {x} vs {y}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

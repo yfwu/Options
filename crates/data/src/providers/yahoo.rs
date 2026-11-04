@@ -120,15 +120,20 @@ fn convert(c: &YContract, kind: OptionKind) -> Option<OptionQuote> {
         .map(|p| p.1)
         .or_else(|| c.expiration.and_then(utc_date))?;
     let strike = c.strike.or(parsed.as_ref().map(|p| p.3))?;
-    // Yahoo reports ~1e-5 (or tiny values) when it has no IV.
-    let iv = c.implied_volatility.filter(|v| v.is_finite() && *v > 0.001);
+    let bid = c.bid.unwrap_or(0.0).max(0.0);
+    let ask = c.ask.unwrap_or(0.0).max(0.0);
+    // Yahoo reports 1e-5 or junk values when it has no IV, and its IV is meaningless
+    // without a two-sided market (weekends / pre-open show bid = ask = 0).
+    let iv = c
+        .implied_volatility
+        .filter(|v| v.is_finite() && *v > 0.005 && v.abs() < 20.0 && (bid > 0.0 || ask > 0.0));
     Some(OptionQuote {
         contract: c.contract_symbol.clone(),
         expiry,
         strike,
         kind,
-        bid: c.bid.unwrap_or(0.0).max(0.0),
-        ask: c.ask.unwrap_or(0.0).max(0.0),
+        bid,
+        ask,
         last: c.last_price.unwrap_or(0.0).max(0.0),
         volume: c.volume.unwrap_or(0.0),
         open_interest: c.open_interest.unwrap_or(0.0),

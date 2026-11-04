@@ -106,7 +106,9 @@ pub struct AppState {
     pub busy: Vec<(u64, SharedString)>,
     next_task: u64,
     pub chain: Option<Arc<OptionChain>>,
+    pub chain_label: SharedString,
     pub settings: Settings,
+    pub svc: Arc<optlab_data::DataService>,
     prices: HashMap<String, Arc<PriceSeries>>,
     vols: HashMap<String, Arc<ScalarSeries>>,
 }
@@ -116,12 +118,15 @@ impl EventEmitter<AppEvent> for AppState {}
 impl AppState {
     pub fn new() -> Self {
         let settings = data_bridge::load_settings();
+        let svc = data_bridge::service(&settings.config);
         Self {
             status: (StatusLevel::Info, "就緒 · 內建離線資料可用".into()),
             busy: vec![],
             next_task: 1,
             chain: None,
+            chain_label: "".into(),
             settings,
+            svc,
             prices: HashMap::new(),
             vols: HashMap::new(),
         }
@@ -149,8 +154,9 @@ impl AppState {
         cx.emit(AppEvent::Navigate(page));
     }
 
-    pub fn set_chain(&mut self, chain: OptionChain, cx: &mut Context<Self>) {
+    pub fn set_chain(&mut self, chain: OptionChain, label: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.chain = Some(Arc::new(chain));
+        self.chain_label = label.into();
         cx.emit(AppEvent::ChainChanged);
         cx.notify();
     }
@@ -164,6 +170,14 @@ impl AppState {
         let s = Arc::new(data_bridge::bundled_prices(&key)?);
         self.prices.insert(key, s.clone());
         Ok(s)
+    }
+
+    /// Replace settings (and rebuild the data service).
+    pub fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
+        self.svc = data_bridge::service(&settings.config);
+        self.settings = settings;
+        cx.emit(AppEvent::SettingsChanged);
+        cx.notify();
     }
 
     /// Bundled volatility index (VIX / VXN ...).

@@ -537,3 +537,60 @@ pub fn sign_color(v: f64) -> Hsla {
         p.text
     }
 }
+
+/// Compact toggle chip (segmented-control item). Attach `.on_click(...)` at the call site.
+pub fn chip(id: impl Into<gpui::ElementId>, label: impl Into<SharedString>, active: bool, cx: &App) -> Stateful<Div> {
+    let theme = cx.theme();
+    let p = palette();
+    h_flex()
+        .id(id)
+        .h(px(22.0))
+        .px_2()
+        .rounded(px(3.0))
+        .cursor_pointer()
+        .text_size(px(11.5))
+        .border_1()
+        .when(active, |d| d.bg(p.blue.opacity(0.2)).border_color(p.blue.opacity(0.6)).text_color(p.text))
+        .when(!active, |d| d.border_color(theme.border).text_color(p.muted).hover(|s| s.bg(p.elevated)))
+        .child(label.into())
+}
+
+/// Level colour for advice cards.
+pub fn advice_color(level: optlab_core::advisor::AdviceLevel) -> Hsla {
+    use optlab_core::advisor::AdviceLevel::*;
+    let p = palette();
+    match level {
+        Info => p.blue,
+        Suggest => p.green,
+        Warning => p.yellow,
+        Risk => p.red,
+    }
+}
+
+/// Advice card (title + body) with a coloured left border.
+pub fn advice_card(a: &optlab_core::advisor::Advice, cx: &App) -> Div {
+    let theme = cx.theme();
+    let c = advice_color(a.level);
+    h_flex()
+        .items_start()
+        .border_1()
+        .border_color(theme.border)
+        .rounded(px(4.0))
+        .bg(theme.sidebar)
+        .overflow_hidden()
+        .child(div().w(px(3.0)).flex_none().h_full().min_h(px(40.0)).bg(c))
+        .child(
+            v_flex()
+                .p_2()
+                .gap_1()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(badge(a.level.label(), c))
+                        .child(div().text_size(px(12.5)).font_weight(gpui::FontWeight::SEMIBOLD).child(a.title.clone())),
+                )
+                .child(div().text_size(px(12.0)).text_color(theme.muted_foreground).child(a.body.clone())),
+        )
+}

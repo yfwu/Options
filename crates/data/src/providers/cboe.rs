@@ -90,7 +90,9 @@ pub struct CboeQuote {
     pub low: Option<f64>,
     /// 30-day implied volatility in percent points (24.9 = 24.9%). For `_VIX` it equals the index.
     pub iv30: Option<f64>,
+    /// Payload time (New York).
     pub as_of: Option<NaiveDateTime>,
+    /// Last trade time as reported (exchange local time).
     pub last_trade_time: Option<NaiveDateTime>,
 }
 
@@ -115,10 +117,17 @@ fn parse_ts(s: &str) -> Option<NaiveDateTime> {
         .ok()
 }
 
+/// The envelope `timestamp` is UTC (it matches fetch time within the CDN cache
+/// window); convert it to New York time like every other provider.
+fn parse_utc_ts(s: &str) -> Option<NaiveDateTime> {
+    parse_ts(s).map(|t| crate::util::unix_to_new_york(t.and_utc().timestamp()))
+}
+
 /// Parse a CBOE delayed-quotes options payload into an [`OptionChain`].
 ///
 /// `requested` is the symbol the user asked for (used for the underlying name
-/// and the exercise style). `as_of` comes from the payload `timestamp`.
+/// and the exercise style). `as_of` is the payload `timestamp` converted from UTC
+/// to New York time.
 pub fn parse_chain(json: &str, requested: &str) -> Result<OptionChain> {
     let env: Envelope<ChainData> = serde_json::from_str(json).context("CBOE: unexpected chain JSON shape")?;
     let d = env.data;
@@ -129,7 +138,7 @@ pub fn parse_chain(json: &str, requested: &str) -> Result<OptionChain> {
     let as_of = env
         .timestamp
         .as_deref()
-        .and_then(parse_ts)
+        .and_then(parse_utc_ts)
         .unwrap_or_else(crate::util::now_new_york);
     let underlying = {
         let r = clean_symbol(requested);
@@ -193,7 +202,7 @@ pub fn parse_quote(json: &str) -> Result<CboeQuote> {
         high: positive(d.high),
         low: positive(d.low),
         iv30: positive(d.iv30),
-        as_of: env.timestamp.as_deref().and_then(parse_ts),
+        as_of: env.timestamp.as_deref().and_then(parse_utc_ts),
         last_trade_time: d.last_trade_time.as_deref().and_then(parse_ts),
     })
 }

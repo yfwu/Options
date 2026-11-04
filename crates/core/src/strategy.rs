@@ -24,6 +24,7 @@ use crate::chain::{OptionChain, OptionKind, OptionQuote};
 use crate::pricing::{bs_greeks, bs_price, implied_vol, norm_cdf, price_with_style, strike_for_delta, year_frac, Greeks};
 use anyhow::{anyhow, bail, Result};
 use chrono::{Datelike, Duration, NaiveDate, Weekday};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Contract multiplier of US equity/index options.
@@ -366,8 +367,12 @@ impl Strategy {
 
     /// Spots where P&L crosses zero on `date`, found by scanning (0, 5·spot] and bisection.
     pub fn breakevens(&self, date: NaiveDate, params: &MarketParams) -> Vec<f64> {
+        self.breakevens_with(&PnlFn::new(self, date, params), params)
+    }
+
+    fn breakevens_with(&self, pf: &PnlFn, params: &MarketParams) -> Vec<f64> {
         let grid = self.scan_grid(params, 1200);
-        let f = |s: f64| self.pnl_at(s, date, params);
+        let f = |s: f64| pf.eval(s);
         let vals: Vec<f64> = grid.iter().map(|s| f(*s)).collect();
         let mut out = Vec::new();
         for i in 1..grid.len() {
@@ -389,11 +394,15 @@ impl Strategy {
     /// Unboundedness is flagged from the P&L slope at the upper boundary
     /// (|slope| > 0.5 share-equivalents).
     pub fn max_profit_loss(&self, date: NaiveDate, params: &MarketParams) -> MaxProfitLoss {
+        self.max_profit_loss_with(&PnlFn::new(self, date, params), params)
+    }
+
+    fn max_profit_loss_with(&self, pf: &PnlFn, params: &MarketParams) -> MaxProfitLoss {
         let grid = self.scan_grid(params, 1200);
         let mut best = (f64::NEG_INFINITY, 0.0);
         let mut worst = (f64::INFINITY, 0.0);
         for &s in &grid {
-            let p = self.pnl_at(s, date, params);
+            let p = pf.eval(s);
             if p > best.0 {
                 best = (p, s);
             }
@@ -402,7 +411,7 @@ impl Strategy {
             }
         }
         let hi = 5.0 * self.ref_spot(params);
-        let slope = (self.pnl_at(hi, date, params) - self.pnl_at(0.98 * hi, date, params)) / (0.02 * hi);
+        let slope = (pf.eval(hi) - pf.eval(0.98 * hi)) / (0.02 * hi);
         MaxProfitLoss {
             max_profit: best.0,
             max_profit_spot: best.1,
@@ -423,12 +432,16 @@ impl Strategy {
     /// or an expected annual return for a "real-world" view. Profit regions are located
     /// in z-space and integrated exactly with the normal CDF.
     pub fn probability_of_profit(&self, date: NaiveDate, params: &MarketParams, sigma: f64, drift: f64) -> f64 {
+        self.pop_with(&PnlFn::new(self, date, params), params, sigma, drift)
+    }
+
+    fn pop_with(&self, pf: &PnlFn, params: &MarketParams, sigma: f64, drift: f64) -> f64 {
         let s0 = self.ref_spot(params);
-        let t = year_frac(self.created, date).max(0.0);
+        let t = year_frac(self.created, pf.date).max(0.0);
         if t <= 0.0 || sigma <= 0.0 {
-            return if self.pnl_at(s0, date, params) > 0.0 { 1.0 } else { 0.0 };
+            return if pf.eval(s0) > 0.0 { 1.0 } else { 0.0 };
         }
-        let f = |z: f64| self.pnl_at(Self::spot_at_z(s0, z, t, sigma, drift), date, params);
+        let f = |z: f64| pf.eval(Self::spot_at_z(s0, z, t, sigma, drift));
         let zs = linspace(-8.0, 8.0, 1601);
         let vals: Vec<f64> = zs.iter().map(|z| f(*z)).collect();
         let mut prob = 0.0;
@@ -453,10 +466,14 @@ impl Strategy {
     /// Expected P&L ($) on `date` under the same lognormal model as
     /// [`Self::probability_of_profit`] (Simpson integration over z ∈ [−8, 8]).
     pub fn expected_pnl(&self, date: NaiveDate, params: &MarketParams, sigma: f64, drift: f64) -> f64 {
+        self.expected_pnl_with(&PnlFn::new(self, date, params), params, sigma, drift)
+    }
+
+    fn expected_pnl_with(&self, pf: &PnlFn, params: &MarketParams, sigma: f64, drift: f64) -> f64 {
         let s0 = self.ref_spot(params);
-        let t = year_frac(self.created, date).max(0.0);
+        let t = year_frac(self.created, pf.date).max(0.0);
         if t <= 0.0 || sigma <= 0.0 {
-            return self.pnl_at(s0, date, params);
+            return pf.eval(s0);
         }
         let n = 1600; // even
         let (a, b) = (-8.0, 8.0);
@@ -466,7 +483,7 @@ impl Strategy {
             let z = a + h * i as f64;
             let w = if i == 0 || i == n { 1.0 } else if i % 2 == 1 { 4.0 } else { 2.0 };
             let pdf = (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt();
-            sum += w * pdf * self.pnl_at(Self::spot_at_z(s0, z, t, sigma, drift), date, params);
+            sum += w * pdf * pf.eval(Self::spot_at_z(s0, z, t, sigma, drift));
         }
         sum * h / 3.0
     }
@@ -494,12 +511,17 @@ impl Strategy {
     /// Short calls are covered by long calls and long stock (per 100 shares),
     /// short puts by long puts. Spread margin on covered portions is ignored.
     pub fn margin_required(&self, params: &MarketParams) -> f64 {
+        let pf = PnlFn::new(self, self.expiry_date(), params);
+        self.margin_with(&self.max_profit_loss_with(&pf, params), params)
+    }
+
+    fn margin_with(&self, at_expiry: &MaxProfitLoss, params: &MarketParams) -> f64 {
         let s = self.ref_spot(params);
         let (lc, sc, lp, sp, shares) = self.exposure_counts();
         let unc_calls = (sc - lc - shares.max(0.0) / OPTION_MULTIPLIER).max(0.0);
         let unc_puts = (sp - lp).max(0.0);
         if unc_calls <= 1e-9 && unc_puts <= 1e-9 {
-            return self.bounded_capital(params);
+            return self.bounded_capital(at_expiry);
         }
         let long_cost: f64 = self.legs.iter().filter(|l| l.quantity > 0.0).map(Leg::cost).sum();
         let mut req = long_cost;
@@ -525,9 +547,8 @@ impl Strategy {
         req.max(0.0)
     }
 
-    fn bounded_capital(&self, params: &MarketParams) -> f64 {
-        let m = self.max_profit_loss(self.expiry_date(), params);
-        (-m.max_loss).max(self.entry_cost()).max(0.0)
+    fn bounded_capital(&self, at_expiry: &MaxProfitLoss) -> f64 {
+        (-at_expiry.max_loss).max(self.entry_cost()).max(0.0)
     }
 
     /// Rough capital tied up ($), cash-account style:
@@ -536,33 +557,98 @@ impl Strategy {
     ///   e.g. credit spread = width·100 − credit, CSP = strike·100 − credit;
     /// * unbounded loss (naked short calls) → [`Self::margin_required`] (Reg-T ≈ 20% rule).
     pub fn capital_required(&self, params: &MarketParams) -> f64 {
-        let m = self.max_profit_loss(self.expiry_date(), params);
-        if m.loss_unbounded {
-            self.margin_required(params)
+        let pf = PnlFn::new(self, self.expiry_date(), params);
+        self.capital_with(&self.max_profit_loss_with(&pf, params), params)
+    }
+
+    fn capital_with(&self, at_expiry: &MaxProfitLoss, params: &MarketParams) -> f64 {
+        if at_expiry.loss_unbounded {
+            self.margin_with(at_expiry, params)
         } else {
-            (-m.max_loss).max(self.entry_cost()).max(0.0)
+            self.bounded_capital(at_expiry)
         }
     }
 
     /// Everything a strategy card needs. Greeks are taken at `params.spot` on `created`;
-    /// breakevens / max P&L / probabilities on `date` (typically the earliest expiry).
+    /// breakevens / max P&L / probabilities on `date` (typically the earliest expiry);
+    /// capital and margin always at the earliest expiry.
     pub fn summary(&self, date: NaiveDate, params: &MarketParams, sigma: f64, drift: f64) -> StrategySummary {
         let s = self.ref_spot(params);
         let greeks = self.greeks(s, self.created, params);
-        let capital = self.capital_required(params);
+        let pf = PnlFn::new(self, date, params);
+        let mpl = self.max_profit_loss_with(&pf, params);
+        let exp_date = self.expiry_date();
+        let mpl_exp = if exp_date == date {
+            mpl
+        } else {
+            self.max_profit_loss_with(&PnlFn::new(self, exp_date, params), params)
+        };
+        let capital = self.capital_with(&mpl_exp, params);
         StrategySummary {
             entry_cost: self.entry_cost(),
             net_premium: self.net_premium(),
             capital_required: capital,
-            margin_required: self.margin_required(params),
+            margin_required: self.margin_with(&mpl_exp, params),
             greeks,
-            breakevens: self.breakevens(date, params),
-            max_profit_loss: self.max_profit_loss(date, params),
-            probability_of_profit: self.probability_of_profit(date, params, sigma, drift),
-            expected_pnl: self.expected_pnl(date, params, sigma, drift),
+            breakevens: self.breakevens_with(&pf, params),
+            max_profit_loss: mpl,
+            probability_of_profit: self.pop_with(&pf, params, sigma, drift),
+            expected_pnl: self.expected_pnl_with(&pf, params, sigma, drift),
             leverage: if capital > 0.0 { greeks.delta * s / capital } else { 0.0 },
             evaluation_date: date,
         }
+    }
+}
+
+/// P&L evaluator on a fixed date used by the numerical scans.
+///
+/// With European marking it is exactly [`Strategy::pnl_at`]. With American marking,
+/// binomial trees are too slow for thousands of evaluations, so the P&L is the
+/// European BS value plus the (smooth) early-exercise premium interpolated from
+/// ~150 American valuations on a spot grid (dense around spot, geometric in the tails).
+struct PnlFn<'a> {
+    strategy: &'a Strategy,
+    date: NaiveDate,
+    euro: MarketParams,
+    cost: f64,
+    prem_x: Vec<f64>,
+    prem_y: Vec<f64>,
+}
+
+impl<'a> PnlFn<'a> {
+    fn new(strategy: &'a Strategy, date: NaiveDate, params: &MarketParams) -> Self {
+        let euro = MarketParams { american: false, ..*params };
+        let alive = strategy.legs.iter().any(|l| l.is_option() && !l.is_expired(date));
+        let (mut prem_x, mut prem_y) = (Vec::new(), Vec::new());
+        if params.american && alive {
+            let s = strategy.ref_spot(params);
+            let geom = |a: f64, b: f64, n: usize| -> Vec<f64> {
+                (0..n).map(|i| a * (b / a).powf(i as f64 / (n - 1) as f64)).collect()
+            };
+            let mut xs = geom(s * 1e-6, 0.25 * s, 25);
+            xs.extend(linspace(0.25 * s, 2.5 * s, 101));
+            xs.extend(geom(2.5 * s, 50.0 * s, 20));
+            xs.sort_by(f64::total_cmp);
+            xs.dedup_by(|a, b| (*a - *b).abs() < 1e-12 * b.abs().max(1.0));
+            prem_y = xs
+                .par_iter()
+                .map(|x| strategy.value_at(*x, date, params) - strategy.value_at(*x, date, &euro))
+                .collect();
+            prem_x = xs;
+        }
+        PnlFn { strategy, date, euro, cost: strategy.entry_cost(), prem_x, prem_y }
+    }
+
+    fn eval(&self, spot: f64) -> f64 {
+        let base = self.strategy.value_at(spot, self.date, &self.euro) - self.cost;
+        if self.prem_x.len() < 2 {
+            return base;
+        }
+        let xs = &self.prem_x;
+        let j = xs.partition_point(|g| *g < spot).clamp(1, xs.len() - 1);
+        let (x0, x1) = (xs[j - 1], xs[j]);
+        let w = if x1 > x0 { ((spot - x0) / (x1 - x0)).clamp(0.0, 1.0) } else { 0.0 };
+        base + self.prem_y[j - 1] * (1.0 - w) + self.prem_y[j] * w
     }
 }
 
@@ -1626,6 +1712,28 @@ pub(crate) mod tests {
         // Expired legs → intrinsic.
         assert!((s.value_at(90.0, e, &euro) - 3000.0).abs() < 1e-9);
         assert!(s.legs[0].is_expired(e));
+    }
+
+    #[test]
+    fn american_scans_are_accurate_and_fast() {
+        let created = d(2026, 11, 4);
+        // Put diagonal: long 1y ITM put, short 1m put; evaluated at the short expiry.
+        let s = Strategy::new("pd", "SPY", created)
+            .with_leg(Leg::option(Put, 110.0, d(2027, 11, 19), 1.0, 14.0, 0.22))
+            .with_leg(Leg::option(Put, 95.0, d(2026, 12, 18), -1.0, 1.0, 0.22));
+        let p = MarketParams::new(100.0, 0.06, 0.0).with_american(true);
+        let t0 = std::time::Instant::now();
+        let sum = s.summary(s.expiry_date(), &p, 0.22, 0.06);
+        let elapsed = t0.elapsed().as_secs_f64();
+        assert!(elapsed < 20.0, "{elapsed}");
+        assert!(!sum.breakevens.is_empty());
+        for be in &sum.breakevens {
+            let direct = s.pnl_at(*be, s.expiry_date(), &p);
+            assert!(direct.abs() < 1.0, "be {be} direct pnl {direct}");
+        }
+        // Scans agree with direct American valuation at the extrema.
+        let m = sum.max_profit_loss;
+        assert!((s.pnl_at(m.max_profit_spot, s.expiry_date(), &p) - m.max_profit).abs() < 1.0);
     }
 
     #[test]

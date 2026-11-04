@@ -1,0 +1,6 @@
+LEAPS d0.80 1.0x: CAGR 12.4% vol 29.0% Sharpe 0.48 MDD -84.0% wiped false rolls 36 costs/yr 0.64% carry 6.03%/yr of notional
+  bench 買進持有 QQQ: CAGR 10.8% MDD -83.0%
+  bench 每日再平衡 1.00x QQQ: CAGR 9.7% MDD -83.4%
+LEAPS d0.80 1.5x: CAGR 13.0% vol 41.8% Sharpe 0.45 MDD -95.2% wiped false rolls 32 costs/yr 0.78% carry 5.56%/yr of notional
+LEAPS d0.80 2.0x: CAGR 13.3% vol 54.9% Sharpe 0.46 MDD -98.4% wiped false rolls 31 costs/yr 1.03% carry 5.79%/yr of notional
+LEAPS d0.60 1.5x: CAGR 14.0% vol 42.2% Sharpe 0.47 MDD -94.0% wiped false rolls 51 costs/yr 1.20% carry 13.52%/yr of notional

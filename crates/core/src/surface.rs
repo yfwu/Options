@@ -7,7 +7,7 @@
 //! they are inverted from the mid price with Black-Scholes.
 
 use crate::chain::{OptionChain, OptionKind, OptionQuote};
-use crate::pricing::{bs_greeks, implied_vol, norm_pdf, strike_for_delta, year_frac};
+use crate::pricing::{bs_greeks, implied_vol, strike_for_delta, year_frac};
 use crate::strategy::sane_iv;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
@@ -194,8 +194,9 @@ fn solve3(mut m: [[f64; 3]; 3], mut v: [f64; 3]) -> Option<[f64; 3]> {
         v.swap(col, piv);
         for row in col + 1..3 {
             let f = m[row][col] / m[col][col];
-            for c in col..3 {
-                m[row][c] -= f * m[col][c];
+            let pivot_row = m[col];
+            for (dst, src) in m[row].iter_mut().zip(pivot_row).skip(col) {
+                *dst -= f * src;
             }
             v[row] -= f * v[col];
         }
@@ -664,15 +665,6 @@ impl ChainAnalytics {
     }
 }
 
-/// Black-Scholes vega per share per vol point (helper for weights elsewhere).
-pub fn vega_1pt(spot: f64, strike: f64, t: f64, r: f64, q: f64, sigma: f64) -> f64 {
-    if t <= 0.0 || sigma <= 0.0 {
-        return 0.0;
-    }
-    let d1 = ((spot / strike).ln() + (r - q + 0.5 * sigma * sigma) * t) / (sigma * t.sqrt());
-    spot * (-q * t).exp() * norm_pdf(d1) * t.sqrt() * 0.01
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,7 +689,7 @@ mod tests {
 
     #[test]
     fn quadratic_fit_exact() {
-        let pts: Vec<(f64, f64, f64)> = (-10..=10).map(|i| {
+        let pts: Vec<(f64, f64, f64)> = (-10i32..=10).map(|i| {
             let x = i as f64 * 0.05;
             (x, 0.2 - 0.1 * x + 0.3 * x * x, 1.0 + i.abs() as f64)
         }).collect();

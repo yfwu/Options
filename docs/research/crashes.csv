@@ -1,0 +1,37 @@
+window,strategy,total_return,max_dd,wiped
+2000-02 dotcom,LEAPS d0.80 1.0x,-0.7897,-0.8483,false
+2000-02 dotcom,買進持有 QQQ,-0.7654,-0.8296,false
+2000-02 dotcom,每日再平衡 1.00x QQQ,-0.7722,-0.8337,false
+2000-02 dotcom,LEAPS d0.80 1.5x,-0.9296,-0.9552,false
+2000-02 dotcom,LEAPS d0.80 2.0x,-0.9700,-0.9838,false
+2000-02 dotcom,LEAPS d0.60 1.5x,-0.9036,-0.9398,false
+2007-10 GFC,LEAPS d0.80 1.0x,-0.2353,-0.5191,false
+2007-10 GFC,買進持有 QQQ,-0.2951,-0.5340,false
+2007-10 GFC,每日再平衡 1.00x QQQ,-0.3067,-0.5387,false
+2007-10 GFC,LEAPS d0.80 1.5x,-0.4358,-0.7006,false
+2007-10 GFC,LEAPS d0.80 2.0x,-0.6372,-0.8114,false
+2007-10 GFC,LEAPS d0.60 1.5x,-0.3791,-0.6659,false
+2018-Q4,LEAPS d0.80 1.0x,0.0499,-0.2007,false
+2018-Q4,買進持有 QQQ,0.0265,-0.2270,false
+2018-Q4,每日再平衡 1.00x QQQ,0.0201,-0.2287,false
+2018-Q4,LEAPS d0.80 1.5x,0.0610,-0.2889,false
+2018-Q4,LEAPS d0.80 2.0x,0.0944,-0.3491,false
+2018-Q4,LEAPS d0.60 1.5x,0.1195,-0.2405,false
+2020-02 COVID,LEAPS d0.80 1.0x,0.5618,-0.2043,false
+2020-02 COVID,買進持有 QQQ,0.3312,-0.2856,false
+2020-02 COVID,每日再平衡 1.00x QQQ,0.3239,-0.2861,false
+2020-02 COVID,LEAPS d0.80 1.5x,0.7894,-0.2933,false
+2020-02 COVID,LEAPS d0.80 2.0x,0.9422,-0.3716,false
+2020-02 COVID,LEAPS d0.60 1.5x,0.7526,-0.2444,false
+2022 bear,LEAPS d0.80 1.0x,-0.0570,-0.3681,false
+2022 bear,買進持有 QQQ,-0.0530,-0.3512,false
+2022 bear,每日再平衡 1.00x QQQ,-0.0675,-0.3574,false
+2022 bear,LEAPS d0.80 1.5x,-0.0648,-0.4957,false
+2022 bear,LEAPS d0.80 2.0x,-0.1088,-0.5936,false
+2022 bear,LEAPS d0.60 1.5x,-0.0566,-0.5048,false
+2025 tariff,LEAPS d0.80 1.0x,0.1586,-0.1916,false
+2025 tariff,買進持有 QQQ,0.0934,-0.2277,false
+2025 tariff,每日再平衡 1.00x QQQ,0.0883,-0.2287,false
+2025 tariff,LEAPS d0.80 1.5x,0.1880,-0.2834,false
+2025 tariff,LEAPS d0.80 2.0x,0.1428,-0.3591,false
+2025 tariff,LEAPS d0.60 1.5x,0.1942,-0.2430,false

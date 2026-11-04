@@ -12,6 +12,8 @@ pub mod montecarlo;
 pub mod synth;
 pub mod stats;
 pub mod backtest;
+pub mod optimize;
+pub mod advisor;
 
 pub use chain::{ExerciseStyle, OptionChain, OptionKind, OptionQuote};
 pub use history::{Bar, PriceSeries, ScalarSeries};

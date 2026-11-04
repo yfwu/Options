@@ -1075,6 +1075,7 @@ fn paint_heatmap(spec: &HeatmapSpec, bounds: Bounds<Pixels>, window: &mut Window
     let theme = cx.theme();
     let muted = theme.muted_foreground;
     let fg = theme.foreground;
+    let empty_c = theme.muted;
     let nr = spec.row_labels.len();
     let nc = spec.col_labels.len();
     if nr == 0 || nc == 0 {
@@ -1125,7 +1126,7 @@ fn paint_heatmap(spec: &HeatmapSpec, bounds: Bounds<Pixels>, window: &mut Window
                     diverging(t)
                 }
                 Some(v) if v.is_finite() => diverging(0.5),
-                _ => theme.muted,
+                _ => empty_c,
             };
             let cell = Bounds::new(point(px(x), px(y)), size(px(cw - 1.0), px(ch - 1.0)));
             window.paint_quad(fill(cell, color));

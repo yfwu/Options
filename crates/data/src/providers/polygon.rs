@@ -200,19 +200,16 @@ impl PolygonClient {
         send_text(self.client.get(&full).header("Accept", "application/json"), &format!("Polygon {}", redact(url)))
     }
 
-    /// Full chain via paginated snapshot. `spot_hint` is used when the plan
-    /// does not include `underlying_asset.price`.
-    pub fn fetch_chain(&self, sym: &str, spot_hint: Option<f64>) -> Result<OptionChain> {
+    /// All snapshot pages merged (quotes, underlying price if present, as-of).
+    pub fn fetch_snapshot(&self, sym: &str) -> Result<SnapshotPage> {
         let u = polygon_underlying(sym);
         let mut url = format!("{}/v3/snapshot/options/{u}?limit=250", self.base);
-        let mut quotes = Vec::new();
-        let mut spot = None;
-        let mut as_of = None;
+        let mut all = SnapshotPage { quotes: Vec::new(), underlying_price: None, as_of: None, next_url: None };
         for _ in 0..MAX_PAGES {
             let page = parse_snapshot_page(&self.get(&url)?)?;
-            quotes.extend(page.quotes);
-            spot = spot.or(page.underlying_price);
-            as_of = match (as_of, page.as_of) {
+            all.quotes.extend(page.quotes);
+            all.underlying_price = all.underlying_price.or(page.underlying_price);
+            all.as_of = match (all.as_of, page.as_of) {
                 (Some(a), Some(b)) => Some(std::cmp::max(a, b)),
                 (a, b) => a.or(b),
             };
@@ -221,20 +218,32 @@ impl PolygonClient {
                 None => break,
             }
         }
-        if quotes.is_empty() {
+        if all.quotes.is_empty() {
             return Err(anyhow!("Polygon: snapshot for {u} returned no contracts"));
         }
-        let spot = spot
-            .or(spot_hint)
-            .ok_or_else(|| anyhow!("Polygon: snapshot for {u} has no underlying price (plan without underlying data?)"))?;
-        let underlying = clean_symbol(sym);
-        Ok(OptionChain {
-            style: style_for(&underlying),
-            underlying,
-            spot,
-            as_of: as_of.unwrap_or_else(crate::util::now_new_york),
-            source: SOURCE.to_string(),
-            quotes,
-        })
+        Ok(all)
     }
+
+    /// Full chain via paginated snapshot. `spot_hint` is used when the plan
+    /// does not include `underlying_asset.price`.
+    pub fn fetch_chain(&self, sym: &str, spot_hint: Option<f64>) -> Result<OptionChain> {
+        let snap = self.fetch_snapshot(sym)?;
+        chain_from_snapshot(sym, snap, spot_hint)
+    }
+}
+
+/// Build a chain from merged snapshot pages.
+pub fn chain_from_snapshot(sym: &str, snap: SnapshotPage, spot_hint: Option<f64>) -> Result<OptionChain> {
+    let underlying = clean_symbol(sym);
+    let spot = snap.underlying_price.or(spot_hint).ok_or_else(|| {
+        anyhow!("Polygon: snapshot for {underlying} has no underlying price (plan without underlying data?)")
+    })?;
+    Ok(OptionChain {
+        style: style_for(&underlying),
+        underlying,
+        spot,
+        as_of: snap.as_of.unwrap_or_else(crate::util::now_new_york),
+        source: SOURCE.to_string(),
+        quotes: snap.quotes,
+    })
 }

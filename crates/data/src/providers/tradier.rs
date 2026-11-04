@@ -156,7 +156,7 @@ pub fn parse_quotes(json: &str) -> Result<Vec<TradierQuote>> {
                 price,
                 time: q
                     .trade_date
-                    .and_then(|ms| DateTime::from_timestamp_millis(ms))
+                    .and_then(DateTime::from_timestamp_millis)
                     .map(|d| crate::util::unix_to_new_york(d.timestamp())),
             })
         })

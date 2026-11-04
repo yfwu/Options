@@ -30,6 +30,7 @@
 //! Expiries snap to the monthly 3rd-Friday closest to `as_of + entry_dte`
 //! (exchange holidays ignored; settlement happens on the first bar on/after it).
 //!
+//! Model prices are floored at intrinsic value (American-style SPY/QQQ calls).
 //! The final equity is marked at model mid (no liquidation cost deducted).
 
 use anyhow::{bail, Result};
@@ -38,7 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chain::OptionKind;
 use crate::history::{PriceSeries, ScalarSeries};
-use crate::pricing::{bs_greeks, Greeks};
+use crate::pricing::Greeks;
 use crate::stats::{compute_stats, PerformanceStats};
 use crate::synth::{CostModel, SynthVolModel};
 
@@ -151,6 +152,10 @@ pub struct RollConfig {
     pub cash_yield: bool,
     pub vol_model: SynthVolModel,
     pub costs: CostModel,
+    /// Spread over the risk-free rate used when **pricing** options (implied
+    /// financing in option prices, e.g. SPX box-spread rates, runs ~0.2–0.5% above
+    /// T-bills). Raises call prices ⇒ conservative. Cash still earns the plain rate.
+    pub option_rate_spread: f64,
     /// Leveraged-ETF benchmark: borrow spread over the risk-free rate.
     pub lev_borrow_spread: f64,
     /// Leveraged-ETF benchmark: annual expense ratio.
@@ -179,6 +184,7 @@ impl Default for RollConfig {
             cash_yield: true,
             vol_model: SynthVolModel::spy(),
             costs: CostModel::spy(),
+            option_rate_spread: 0.003,
             lev_borrow_spread: 0.005,
             lev_expense_ratio: 0.0095,
             start: None,
@@ -294,6 +300,9 @@ pub struct BacktestResult {
     pub avg_theta_pct_equity: f64,
     /// Average risk-free rate over the period (used for Sharpe).
     pub avg_rate: f64,
+    /// Transaction costs as a fraction of equity at the time, summed per year
+    /// (≈ annual return drag from spreads + commissions).
+    pub cost_drag_annual: f64,
     pub wiped_out: bool,
     pub wiped_date: Option<NaiveDate>,
 }
@@ -332,7 +341,7 @@ pub(crate) fn snap_monthly_expiry(as_of: NaiveDate, dte: u32, min_dte: u32) -> N
         if e <= min_date {
             continue;
         }
-        if best.map_or(true, |b| (e - target).num_days().abs() < (b - target).num_days().abs()) {
+        if best.is_none_or(|b| (e - target).num_days().abs() < (b - target).num_days().abs()) {
             best = Some(e);
         }
     }
@@ -436,6 +445,7 @@ pub(crate) struct SimOut {
     pub avg_carry_pct_of_exposure: f64,
     pub avg_theta_pct_equity: f64,
     pub avg_rate: f64,
+    pub cost_drag_annual: f64,
     pub wiped_out: bool,
     pub wiped_date: Option<NaiveDate>,
     pub i0: usize,
@@ -443,10 +453,14 @@ pub(crate) struct SimOut {
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn mark(vm: &SynthVolModel, s: f64, k: f64, expiry: NaiveDate, d: NaiveDate, r: f64, q: f64, vix: f64) -> (f64, Greeks, f64) {
     let t = ((expiry - d).num_days() as f64 / 365.0).max(0.0);
     let iv = vm.iv(k, s, t.max(1.0 / 365.0), vix);
-    (t, bs_greeks(OptionKind::Call, s, k, t, r, q, iv), iv)
+    let mut g = crate::synth::fast_bs_greeks(OptionKind::Call, s, k, t, r, q, iv);
+    // American (SPY/QQQ) calls never trade below parity; European BS can when q > r.
+    g.price = g.price.max(s - k);
+    (t, g, iv)
 }
 
 /// On an exposure-band breach in `Delta` mode, re-strike instead of resizing when
@@ -454,6 +468,8 @@ fn mark(vm: &SynthVolModel, s: f64, k: f64, expiry: NaiveDate, d: NaiveDate, r: 
 /// piling into far-OTM calls after a sell-off or holding near-1-delta calls).
 pub const RESTRIKE_DELTA_GAP: f64 = 0.15;
 
+// `!(x > 0.0)` on purpose: also rejects NaN.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
 pub(crate) fn validate(cfg: &RollConfig) -> Result<()> {
     if !(cfg.initial_capital > 0.0) {
         bail!("initial_capital must be > 0");
@@ -501,6 +517,7 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
     let (mut ext_sum, mut carry_sum, mut ext_cnt) = (0.0, 0.0, 0usize);
     let mut theta_sum = 0.0;
     let mut rate_sum = 0.0;
+    let mut cost_frac_sum = 0.0;
     let mut prev_date = al.dates[i0];
     let mut prev_rate = al.rate[i0];
 
@@ -510,6 +527,7 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
         let vix = al.vol[i];
         let r = al.rate[i];
         rate_sum += r;
+        let r_opt = r + cfg.option_rate_spread;
         if i > i0 && cfg.cash_yield && cash > 0.0 {
             let dt = (d - prev_date).num_days() as f64 / 365.0;
             cash *= (prev_rate * dt).exp();
@@ -548,12 +566,13 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
         let mut g = Greeks::default();
         let mut iv = 0.0;
         if let Some(p) = pos {
-            let (_, gg, v) = mark(vm, s, p.strike, p.expiry, d, r, q, vix);
+            let (_, gg, v) = mark(vm, s, p.strike, p.expiry, d, r_opt, q, vix);
             g = gg;
             iv = v;
         }
         let pos_val = pos.map_or(0.0, |p| p.n * mult * g.price);
         let equity = cash + pos_val;
+        let costs_before = out.total_costs;
 
         // 4. wipe-out
         if equity <= wipe_level {
@@ -720,10 +739,10 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
                 let expiry = snap_monthly_expiry(d, cfg.entry_dte, min_dte_new);
                 let t = (expiry - d).num_days() as f64 / 365.0;
                 let k = match cfg.strike {
-                    StrikeSelection::Delta(dl) => vm.strike_for_delta(OptionKind::Call, dl, s, t, r, q, vix),
+                    StrikeSelection::Delta(dl) => vm.strike_for_delta(OptionKind::Call, dl, s, t, r_opt, q, vix),
                     StrikeSelection::Moneyness(m) => m * s,
                 };
-                let (_, ng, niv) = mark(vm, s, k, expiry, d, r, q, vix);
+                let (_, ng, niv) = mark(vm, s, k, expiry, d, r_opt, q, vix);
                 let mid = ng.price;
                 let buy = cm.buy_price(mid);
                 if mid > 0.0 && ng.delta > 1e-6 && equity_now > 0.0 {
@@ -787,7 +806,9 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
                 theta_sum += -g.theta * 365.0 * n * mult / eq;
             }
         }
-        let _ = traded;
+        if traded && equity > 0.0 {
+            cost_frac_sum += (out.total_costs - costs_before) / equity;
+        }
         out.curve.push((d, eq));
         if full {
             out.records.push(DayRecord {
@@ -813,6 +834,8 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
         out.avg_carry_pct_of_exposure = carry_sum / ext_cnt as f64;
     }
     out.avg_rate = rate_sum / n_days as f64;
+    let yrs = (al.dates[i1] - al.dates[i0]).num_days() as f64 / 365.25;
+    out.cost_drag_annual = if yrs > 0.0 { cost_frac_sum / yrs } else { 0.0 };
     Ok(out)
 }
 
@@ -869,6 +892,7 @@ pub(crate) fn run_on_aligned(al: &Aligned, cfg: &RollConfig) -> Result<BacktestR
         avg_carry_pct_of_exposure: sim.avg_carry_pct_of_exposure,
         avg_theta_pct_equity: sim.avg_theta_pct_equity,
         avg_rate: sim.avg_rate,
+        cost_drag_annual: sim.cost_drag_annual,
         wiped_out: sim.wiped_out,
         wiped_date: sim.wiped_date,
     })

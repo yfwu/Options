@@ -299,9 +299,11 @@ impl Focusable for OptLabApp {
 
 impl Render for OptLabApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
         let dialog_layer = Root::render_dialog_layer(window, cx);
         let notification_layer = Root::render_notification_layer(window, cx);
+        let sidebar = self.render_sidebar(cx).into_any_element();
+        let status_bar = self.render_status_bar(cx).into_any_element();
+        let theme = cx.theme();
         let p = palette();
         v_flex()
             .id("optlab-root")
@@ -328,7 +330,7 @@ impl Render for OptLabApp {
                 h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_sidebar(cx))
+                    .child(sidebar)
                     .child(
                         v_flex()
                             .flex_1()
@@ -349,7 +351,7 @@ impl Render for OptLabApp {
                             .child(div().flex_1().min_h_0().child(self.render_page())),
                     ),
             )
-            .child(self.render_status_bar(cx))
+            .child(status_bar)
             .children(dialog_layer)
             .children(notification_layer)
     }
