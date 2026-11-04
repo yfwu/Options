@@ -130,6 +130,17 @@ fn load_data(key: &str) -> Result<BacktestData> {
             let vol = qqq_vol(&qqq, base == "qqq_bc");
             BacktestData::new(series_from("QQQ", &qqq), vol, rates(rate_kind), q_override.unwrap_or(0.007))
         }
+        "qqq_preset" => {
+            // optlab-data preset style: VIX×2.13 before 2000-10-10, Barchart VXN to 2009-09, CBOE VXN after
+            let qqq = read_col("QQQ_adj_1999.csv", 1);
+            let vix = ScalarSeries::new("VIX", read_col("VIX_History.csv", 4));
+            let bc = read_col("VXN_barchart_2000.csv", 4);
+            let cb = read_col("VXN_History.csv", 4);
+            let mut pts: Vec<(NaiveDate, f64)> = qqq.iter().filter(|p| p.0 < bc[0].0).map(|p| (p.0, vix.value_at(p.0).unwrap() * 2.13)).collect();
+            pts.extend(bc.iter().copied().filter(|p| p.0 < cb[0].0));
+            pts.extend(cb.iter().copied());
+            BacktestData::new(series_from("QQQ", &qqq), ScalarSeries::new("VXN preset", pts), rates(rate_kind), q_override.unwrap_or(0.007))
+        }
         "spy" => {
             let spy = read_col("VIX_SPY_1993.csv", 2);
             let vix = ScalarSeries::new("VIX", read_col("VIX_SPY_1993.csv", 1));

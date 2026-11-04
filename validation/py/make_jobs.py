@@ -73,4 +73,8 @@ for sym, vm in [('qqq', VMQ), ('spy', VMS)]:
     cfgs += [(f'd0.8_{e}x_k3cost1', dict(target_exposure=e, vol_model=V(vm, kappa=3.0), costs=dict(half_spread_pct=0.01, slippage=0.0025))) for e in [1.5, 2.0, 3.0]]
     for tag, extra in [('uncond', dict(stress_frac=0.0, start_in_stress=False)), ('stress', dict(stress_frac=0.15, start_in_stress=False))]:
         dump(f'boot_{sym}_{tag}.json', dict(data=sym, n=3000, days=756, block=60, seed=11, rate=0.03, configs=cfgs, **extra))
+# proxy vs real VXN / rates (§2.5)
+dump('jobs_proxy.json', [dict(name=f'{d}|{e}|{p}', data=d, cfg=dict(target_exposure=e, **({'start': a} if a else {}), **({'end': b} if b else {})))
+    for d in ['qqq', 'qqq:dgs3mo', 'qqq_bc', 'qqq_bc:dgs3mo', 'qqq_preset', 'qqq_preset:dgs3mo'] for e in [1.0, 1.5, 2.0]
+    for p, (a, b) in {'full': (None, None), '1999-2002': (None, '2002-12-31'), 'peak2000+3y': ('2000-03-27', '2003-03-27')}.items()])
 print('ok')

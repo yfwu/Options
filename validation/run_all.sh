@@ -13,7 +13,7 @@ python3 py/make_stress.py
 $H jobs out/jobs_stress.json out/stress.jsonl
 python3 py/analyze_stress.py > /dev/null
 python3 py/make_jobs.py
-for j in main attr full_grid band cc; do $H jobs out/jobs_$j.json out/$j.jsonl; done
+for j in main attr full_grid band cc proxy; do $H jobs out/jobs_$j.json out/$j.jsonl; done
 for s in qqq spy; do for t in uncond stress; do $H boot out/boot_${s}_${t}.json out/boot_${s}_${t}.jsonl; done; done
 (cd py && python3 check_pricing.py && python3 chain_check.py && python3 term_structure.py && python3 replicate.py && python3 robustness_py.py)
 python3 py/attribution.py
