@@ -70,7 +70,7 @@ const C_CONTRACT: &[&str] = &[
     "localsymbol", "instrument", "optioncode",
 ];
 const C_EXPIRY: &[&str] = &[
-    "expiry", "expiration", "expirationdate", "expdate", "exp", "expiry date", "expires", "maturity", "maturitydate",
+    "expiry", "expiration", "expirationdate", "expdate", "exp", "expires", "maturity", "maturitydate",
     "lasttradedateorcontractmonth", "expirydate",
 ];
 const C_STRIKE: &[&str] = &["strike", "strikeprice", "k", "strikes"];
@@ -105,7 +105,7 @@ pub fn parse_chain_csv(text: &str, opts: &ChainCsvOptions) -> Result<OptionChain
     let text = strip_bom(text);
     let mut rdr = reader(text);
     let headers: Vec<String> = rdr.headers().context("CSV: cannot read header row")?.iter().map(norm_header).collect();
-    let col = |names: &[&str]| find_col(&headers, &names.iter().map(|n| norm_header(n)).collect::<Vec<_>>().iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    let col = |names: &[&str]| find_col(&headers, names);
     let c_contract = col(C_CONTRACT);
     let c_exp = col(C_EXPIRY);
     let c_strike = col(C_STRIKE);
@@ -142,6 +142,12 @@ pub fn parse_chain_csv(text: &str, opts: &ChainCsvOptions) -> Result<OptionChain
                 und_from_file = Some(clean_symbol(u));
             } else if let Some(o) = &occ {
                 und_from_file = Some(clean_symbol(&o.0));
+            } else if !raw_contract.is_empty()
+                && raw_contract.len() <= 6
+                && raw_contract.chars().all(|c| c.is_ascii_alphabetic() || matches!(c, '^' | '_' | '.' | '$'))
+            {
+                // A "symbol" column holding the underlying ticker rather than a contract.
+                und_from_file = Some(clean_symbol(&raw_contract));
             }
         }
         if spot_from_file.is_none() {
