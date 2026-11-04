@@ -450,6 +450,12 @@ impl DataService {
 mod tests {
     use super::*;
     #[test]
+    fn service_is_send_sync() {
+        fn check<T: Send + Sync>() {}
+        check::<DataService>();
+    }
+
+    #[test]
     fn provider_roundtrip() {
         for p in Provider::ALL {
             assert_eq!(p.id().parse::<Provider>().unwrap(), p);
