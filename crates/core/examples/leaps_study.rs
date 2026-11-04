@@ -16,6 +16,7 @@
 //! The CSV parsing here is deliberately self-contained (no optlab-data dependency).
 
 use chrono::NaiveDate;
+use optlab_core::advisor::{advise, strategy_conclusions, MarketSnapshot};
 use optlab_core::backtest::{approx_us_tbill_rates, run_backtest, BacktestData, BacktestResult, RateSource, RollConfig, StrikeSelection};
 use optlab_core::chain::OptionKind;
 use optlab_core::history::{Bar, PriceSeries, ScalarSeries};
@@ -330,5 +331,19 @@ fn main() {
             r.prob_dd_over_50 * 100.0
         );
     }
-    let _ = StrikeSelection::Delta(0.8);
+
+    println!("\n=== 7. Advisor (current snapshot) ===");
+    for (data, base) in [(&qqq, RollConfig::qqq()), (&spy, RollConfig::spy())] {
+        let snap = MarketSnapshot::from_history(&data.prices, &data.vol_index);
+        let rows = optimize(data, &base, &ParamGrid::small(), Objective::Utility { lambda: 0.25 }, None);
+        let current = RollConfig { strike: StrikeSelection::Delta(0.8), ..base.clone() };
+        for a in advise(&snap, rows.first(), Some(&current)) {
+            println!("[{}] {}\n    {}", a.level.label(), a.title, a.body);
+        }
+    }
+    if std::env::args().any(|a| a == "--kb") {
+        for a in strategy_conclusions() {
+            println!("[{}] {}\n    {}", a.level.label(), a.title, a.body);
+        }
+    }
 }
