@@ -77,11 +77,12 @@ pub fn kpi(label: impl Into<SharedString>, value: impl Into<SharedString>, color
         .border_color(theme.border)
         .rounded(px(4.0))
         .bg(theme.sidebar)
-        .child(div().text_size(px(11.0)).text_color(theme.muted_foreground).child(label.into()))
+        .child(div().text_size(px(11.0)).text_color(theme.muted_foreground).whitespace_nowrap().child(label.into()))
         .child(
             div()
                 .font_family(MONO_FONT)
-                .text_size(px(16.0))
+                .text_size(px(15.0))
+                .whitespace_nowrap()
                 .text_color(color.unwrap_or(theme.foreground))
                 .child(value.into()),
         )

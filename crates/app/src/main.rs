@@ -129,6 +129,12 @@ fn main() {
                         cx.notify();
                     });
                 })?;
+                // Re-activate so X11 re-evaluates visibility and (re)starts the frame loop.
+                cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
+                handle.update(cx, |_, window, _| {
+                    window.activate_window();
+                    window.refresh();
+                })?;
             }
             Ok::<_, anyhow::Error>(())
         })

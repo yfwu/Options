@@ -30,6 +30,17 @@
 //! Expiries snap to the monthly 3rd-Friday closest to `as_of + entry_dte`
 //! (exchange holidays ignored; settlement happens on the first bar on/after it).
 //!
+//! ## Execution
+//! Triggers are evaluated at the close of day t and, with `exec_lag_days = L` (default
+//! 1), executed at the close of trading day t+L at that day's prices and vol (sizes are
+//! recomputed then). Fills pay `CostModel` half spreads, which widen when the vol index
+//! is above `crisis_ref_vol`.
+//!
+//! ## Survival metrics
+//! `wiped_out` is set when equity ≤ 0.1% of initial capital (the run stops), but the
+//! more useful flags are `min_equity_ratio` (lowest equity / initial) and `near_wipe`
+//! (`min_equity_ratio < near_wipe_level`, default 10%).
+//!
 //! Model prices are floored at intrinsic value (American-style SPY/QQQ calls).
 //! The final equity is marked at model mid (no liquidation cost deducted).
 
@@ -158,8 +169,14 @@ pub struct RollConfig {
     pub option_rate_spread: f64,
     /// Leveraged-ETF benchmark: borrow spread over the risk-free rate.
     pub lev_borrow_spread: f64,
-    /// Leveraged-ETF benchmark: annual expense ratio.
+    /// Leveraged-ETF benchmark: annual expense ratio (not charged at L ≤ 1).
     pub lev_expense_ratio: f64,
+    /// Execution delay: a trigger seen at the close of day t is executed at the close
+    /// of trading day t + lag at that day's prices (0 = same close, optimistic).
+    /// Default 1: you see the close, then trade the next day.
+    pub exec_lag_days: u32,
+    /// "Near wipe-out" threshold on the minimum equity / initial capital (default 0.10).
+    pub near_wipe_level: f64,
     pub start: Option<NaiveDate>,
     pub end: Option<NaiveDate>,
 }
@@ -187,6 +204,8 @@ impl Default for RollConfig {
             option_rate_spread: 0.003,
             lev_borrow_spread: 0.005,
             lev_expense_ratio: 0.0095,
+            exec_lag_days: 1,
+            near_wipe_level: 0.10,
             start: None,
             end: None,
         }
@@ -284,7 +303,11 @@ pub struct BacktestResult {
     pub records: Vec<DayRecord>,
     pub trades: Vec<Trade>,
     pub stats: PerformanceStats,
-    /// `[0]` = buy & hold (adj close), `[1]` = daily-rebalanced L× (L = target exposure).
+    /// `[0]` = buy & hold (adj close), `[1]` = daily-rebalanced L× (L = target exposure;
+    /// no expense ratio at L ≤ 1), `[2]` = exposure-matched linear position (same daily
+    /// realised exposure as the strategy, financed at rf + `option_rate_spread`): the
+    /// difference to `[2]` is the part of the result that is due to the options
+    /// themselves (convexity − theta − costs + vega), not to the leverage path.
     pub benchmarks: Vec<(String, Vec<(NaiveDate, f64)>)>,
     pub benchmark_stats: Vec<(String, PerformanceStats)>,
     pub total_costs: f64,
@@ -303,8 +326,16 @@ pub struct BacktestResult {
     /// Transaction costs as a fraction of equity at the time, summed per year
     /// (≈ annual return drag from spreads + commissions).
     pub cost_drag_annual: f64,
+    /// Equity fell to ≤ 0.1% of initial capital (the run stops).
     pub wiped_out: bool,
     pub wiped_date: Option<NaiveDate>,
+    /// Lowest end-of-day equity / initial capital.
+    #[serde(default)]
+    pub min_equity_ratio: f64,
+    /// `min_equity_ratio < config.near_wipe_level` (default 10%): practically ruined
+    /// even if not technically wiped out.
+    #[serde(default)]
+    pub near_wipe: bool,
 }
 
 impl BacktestResult {
@@ -312,6 +343,38 @@ impl BacktestResult {
     pub fn equity_curve(&self) -> Vec<(NaiveDate, f64)> {
         self.records.iter().map(|r| (r.date, r.equity)).collect()
     }
+    /// 1 − realised average exposure / target (positive ⇒ under-exposed, e.g. when
+    /// `max_premium_pct` binds).
+    pub fn exposure_shortfall(&self) -> f64 {
+        exposure_shortfall(self.avg_exposure, self.config.target_exposure)
+    }
+    /// Config label plus realised exposure when it deviates > 5% from target, and a
+    /// near-wipe / wipe-out marker.
+    pub fn label(&self) -> String {
+        result_label(&self.config, self.avg_exposure, self.min_equity_ratio, self.near_wipe, self.wiped_out)
+    }
+}
+
+/// 1 − avg/target (0 when target is 0).
+pub fn exposure_shortfall(avg_exposure: f64, target: f64) -> f64 {
+    if target > 0.0 {
+        1.0 - avg_exposure / target
+    } else {
+        0.0
+    }
+}
+
+pub(crate) fn result_label(cfg: &RollConfig, avg_exposure: f64, min_equity: f64, near_wipe: bool, wiped: bool) -> String {
+    let mut s = cfg.label();
+    if cfg.target_exposure > 0.0 && avg_exposure > 0.0 && (avg_exposure / cfg.target_exposure - 1.0).abs() > 0.05 {
+        s.push_str(&format!(" (實際 {avg_exposure:.2}x)"));
+    }
+    if wiped {
+        s.push_str(" [歸零]");
+    } else if near_wipe {
+        s.push_str(&format!(" [近歸零 最低 {:.0}%]", min_equity * 100.0));
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -448,6 +511,10 @@ pub(crate) struct SimOut {
     pub cost_drag_annual: f64,
     pub wiped_out: bool,
     pub wiped_date: Option<NaiveDate>,
+    pub min_equity_ratio: f64,
+    pub near_wipe: bool,
+    /// End-of-day exposure for every day of `[i0, i1]` (0 after a wipe-out).
+    pub exposures: Vec<f64>,
     pub i0: usize,
     pub i1: usize,
 }
@@ -488,6 +555,14 @@ pub(crate) fn validate(cfg: &RollConfig) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Act {
+    Nothing,
+    Open,
+    Roll(&'static str),
+    Rebalance,
+}
+
 /// Core simulation on aligned data. `full` = keep daily records and trade list.
 pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<SimOut> {
     validate(cfg)?;
@@ -502,16 +577,19 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
     let band = cfg.rebalance_band.unwrap_or(0.0);
     let wipe_level = cfg.initial_capital * 1e-3;
     let min_dte_new = cfg.roll_dte + 14;
+    let lag = cfg.exec_lag_days as usize;
 
     let n_days = i1 - i0 + 1;
-    let mut out = SimOut { i0, i1, ..Default::default() };
+    let mut out = SimOut { i0, i1, min_equity_ratio: f64::INFINITY, ..Default::default() };
     out.curve.reserve(n_days);
+    out.exposures.reserve(n_days);
     if full {
         out.records.reserve(n_days);
     }
 
     let mut cash = cfg.initial_capital;
     let mut pos: Option<Pos> = None;
+    let mut pending: Option<(Act, usize)> = None;
     let mut opened_before = false;
     let (mut exp_sum, mut exp_cnt) = (0.0, 0usize);
     let (mut ext_sum, mut carry_sum, mut ext_cnt) = (0.0, 0.0, 0usize);
@@ -579,7 +657,9 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
             out.wiped_out = true;
             out.wiped_date = Some(d);
             let eq = equity.max(0.0);
+            out.min_equity_ratio = out.min_equity_ratio.min(eq / cfg.initial_capital);
             out.curve.push((d, eq));
+            out.exposures.resize(n_days, 0.0);
             if full {
                 out.records.push(DayRecord {
                     date: d,
@@ -605,14 +685,8 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
             break;
         }
 
-        // 5. triggers
-        enum Act {
-            Nothing,
-            Open,
-            Roll(&'static str),
-            Rebalance,
-        }
-        let act = match pos {
+        // 5. triggers (signal at today's close)
+        let signal = match pos {
             None => Act::Open,
             Some(p) => {
                 let dte = (p.expiry - d).num_days();
@@ -637,6 +711,26 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
                 }
             }
         };
+        // execution, possibly delayed by `exec_lag_days`
+        let act = if lag == 0 {
+            signal
+        } else {
+            if pending.is_none() && !matches!(signal, Act::Nothing) {
+                pending = Some((signal, i + lag));
+            }
+            match pending {
+                Some((a, due)) if i >= due => {
+                    pending = None;
+                    a
+                }
+                _ => Act::Nothing,
+            }
+        };
+        // the position may have expired while the order was pending
+        let act = match (act, pos) {
+            (Act::Rebalance | Act::Roll(_), None) => Act::Open,
+            (a, _) => a,
+        };
 
         let mut traded = false;
         match act {
@@ -644,8 +738,8 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
             Act::Rebalance => {
                 let p = pos.as_mut().unwrap();
                 let target_n = cfg.target_exposure * equity / (g.delta * s * mult).max(1e-12);
-                let buy = cm.buy_price(g.price);
-                let sell = cm.sell_price(g.price);
+                let buy = cm.buy_price_at(g.price, vix);
+                let sell = cm.sell_price_at(g.price, vix);
                 let mut new_n = target_n;
                 if new_n > p.n {
                     let cap_n = cfg.max_premium_pct * equity / (g.price * mult).max(1e-12);
@@ -665,15 +759,13 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
                 }
                 let dn = new_n - p.n;
                 let meaningful = if cfg.integer_contracts { dn.abs() >= 1.0 } else { dn.abs() > 0.01 * p.n.max(1e-9) };
-                if meaningful {
+                // selling options worth less than the commission makes no sense
+                if meaningful && (dn > 0.0 || sell * mult > comm) {
                     let (px, c) = if dn > 0.0 {
                         (buy, dn * (buy - g.price) * mult + dn * comm)
                     } else {
                         (sell, -dn * (g.price - sell) * mult - dn * comm)
                     };
-                    // selling options worth less than the commission makes no sense
-                    let meaningful = dn > 0.0 || sell * mult > comm;
-                    if meaningful {
                     cash -= dn * px * mult + dn.abs() * comm;
                     out.total_costs += c;
                     p.n = new_n;
@@ -694,7 +786,6 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
                             reason: "曝險偏離目標，再平衡口數".into(),
                         });
                     }
-                    }
                 }
             }
             Act::Open | Act::Roll(_) => {
@@ -706,7 +797,7 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
                 };
                 // close existing
                 if let Some(p) = pos.take() {
-                    let mut sell = cm.sell_price(g.price);
+                    let mut sell = cm.sell_price_at(g.price, vix);
                     let mut leg_comm = comm;
                     if sell * mult <= comm {
                         // worthless: abandon instead of paying commission to sell
@@ -744,7 +835,7 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
                 };
                 let (_, ng, niv) = mark(vm, s, k, expiry, d, r_opt, q, vix);
                 let mid = ng.price;
-                let buy = cm.buy_price(mid);
+                let buy = cm.buy_price_at(mid, vix);
                 if mid > 0.0 && ng.delta > 1e-6 && equity_now > 0.0 {
                     let unit = buy * mult + comm;
                     let target_n = cfg.target_exposure * equity_now / (ng.delta * s * mult);
@@ -809,7 +900,9 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
         if traded && equity > 0.0 {
             cost_frac_sum += (out.total_costs - costs_before) / equity;
         }
+        out.min_equity_ratio = out.min_equity_ratio.min(eq / cfg.initial_capital);
         out.curve.push((d, eq));
+        out.exposures.push(exposure);
         if full {
             out.records.push(DayRecord {
                 date: d,
@@ -836,6 +929,10 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
     out.avg_rate = rate_sum / n_days as f64;
     let yrs = (al.dates[i1] - al.dates[i0]).num_days() as f64 / 365.25;
     out.cost_drag_annual = if yrs > 0.0 { cost_frac_sum / yrs } else { 0.0 };
+    if !out.min_equity_ratio.is_finite() {
+        out.min_equity_ratio = 1.0;
+    }
+    out.near_wipe = out.wiped_out || out.min_equity_ratio < cfg.near_wipe_level;
     Ok(out)
 }
 
@@ -845,8 +942,10 @@ pub(crate) fn buy_hold_curve(al: &Aligned, i0: usize, i1: usize, capital: f64) -
     (i0..=i1).map(|i| (al.dates[i], capital * al.adj[i] / a0)).collect()
 }
 
-/// Daily-rebalanced leveraged-ETF-like curve: `L·r − (L−1)·(rf + spread if L>1) − ER`.
+/// Daily-rebalanced leveraged-ETF-like curve: `L·r − (L−1)·(rf + spread if L>1) − ER`
+/// (the expense ratio is only charged when L > 1; a 1× "fund" is buy & hold).
 pub(crate) fn leveraged_curve(al: &Aligned, i0: usize, i1: usize, capital: f64, lev: f64, spread: f64, er: f64) -> Vec<(NaiveDate, f64)> {
+    let er = if lev > 1.0 + 1e-9 { er } else { 0.0 };
     let mut v = capital;
     let mut out = Vec::with_capacity(i1 - i0 + 1);
     out.push((al.dates[i0], v));
@@ -855,6 +954,25 @@ pub(crate) fn leveraged_curve(al: &Aligned, i0: usize, i1: usize, capital: f64, 
         let r = al.adj[i] / al.adj[i - 1] - 1.0;
         let fin = (lev - 1.0) * (al.rate[i - 1] + if lev > 1.0 { spread } else { 0.0 });
         v *= 1.0 + lev * r - fin * dt - er * dt;
+        v = v.max(0.0);
+        out.push((al.dates[i], v));
+    }
+    out
+}
+
+/// Exposure-matched linear benchmark: each day hold `e_{t−1}` × the total-return index
+/// (e = the strategy's realised end-of-day exposure), financing `e−1` at rf + `spread`
+/// (or earning rf on idle cash when e < 1). `exposures[k]` is the exposure on day i0+k.
+pub(crate) fn exposure_matched_curve(al: &Aligned, i0: usize, i1: usize, capital: f64, exposures: &[f64], spread: f64) -> Vec<(NaiveDate, f64)> {
+    let mut v = capital;
+    let mut out = Vec::with_capacity(i1 - i0 + 1);
+    out.push((al.dates[i0], v));
+    for i in i0 + 1..=i1 {
+        let e = exposures.get(i - 1 - i0).copied().unwrap_or(0.0);
+        let dt = (al.dates[i] - al.dates[i - 1]).num_days() as f64 / 365.0;
+        let r = al.adj[i] / al.adj[i - 1] - 1.0;
+        let fin = (e - 1.0) * (al.rate[i - 1] + if e > 1.0 { spread } else { 0.0 });
+        v *= 1.0 + e * r - fin * dt;
         v = v.max(0.0);
         out.push((al.dates[i], v));
     }
@@ -872,10 +990,12 @@ pub(crate) fn run_on_aligned(al: &Aligned, cfg: &RollConfig) -> Result<BacktestR
     let stats = compute_stats(&sim.curve, sim.avg_rate);
     let bh = buy_hold_curve(al, sim.i0, sim.i1, cfg.initial_capital);
     let lev = leveraged_curve(al, sim.i0, sim.i1, cfg.initial_capital, cfg.target_exposure, cfg.lev_borrow_spread, cfg.lev_expense_ratio);
+    let matched = exposure_matched_curve(al, sim.i0, sim.i1, cfg.initial_capital, &sim.exposures, cfg.option_rate_spread);
     let sym = if al.symbol.is_empty() { "標的".to_string() } else { al.symbol.clone() };
     let benchmarks = vec![
         (format!("買進持有 {sym}"), bh),
         (format!("每日再平衡 {:.2}x {sym}", cfg.target_exposure), lev),
+        (format!("曝險配對線性 {sym}（平均 {:.2}x）", sim.avg_exposure), matched),
     ];
     let benchmark_stats = benchmarks.iter().map(|(n, c)| (n.clone(), compute_stats(c, sim.avg_rate))).collect();
     Ok(BacktestResult {
@@ -895,6 +1015,8 @@ pub(crate) fn run_on_aligned(al: &Aligned, cfg: &RollConfig) -> Result<BacktestR
         cost_drag_annual: sim.cost_drag_annual,
         wiped_out: sim.wiped_out,
         wiped_date: sim.wiped_date,
+        min_equity_ratio: sim.min_equity_ratio,
+        near_wipe: sim.near_wipe,
     })
 }
 
@@ -1067,6 +1189,78 @@ mod tests {
         let a = &res.benchmarks[0].1;
         let b = &res.benchmarks[1].1;
         assert!((a.last().unwrap().1 - b.last().unwrap().1).abs() < 1e-6 * a.last().unwrap().1);
+    }
+
+    #[test]
+    fn near_wipe_and_min_equity() {
+        // R1: −85% linear crash; 2.0x is not "wiped" (> 0.1%) but practically ruined.
+        let mut closes = vec![100.0; 20];
+        closes.extend((0..500).map(|i| 100.0 * (1.0 - 0.85 * i as f64 / 499.0)));
+        closes.extend(vec![15.0; 100]);
+        let data = path_data(&closes, 35.0, 0.02);
+        let r1 = run_backtest(&data, &RollConfig { target_exposure: 1.0, ..RollConfig::default() }).unwrap();
+        let r2 = run_backtest(&data, &RollConfig { target_exposure: 2.0, ..RollConfig::default() }).unwrap();
+        assert!(r1.min_equity_ratio > 0.05 && r1.min_equity_ratio < 0.3, "{}", r1.min_equity_ratio);
+        assert!(r2.min_equity_ratio < 0.1 && r2.near_wipe, "{}", r2.min_equity_ratio);
+        let min_curve = r2.records.iter().map(|x| x.equity).fold(f64::INFINITY, f64::min) / r2.config.initial_capital;
+        assert!((min_curve - r2.min_equity_ratio).abs() < 1e-12);
+        assert!(r2.label().contains("近歸零") || r2.wiped_out);
+    }
+
+    #[test]
+    fn one_x_benchmark_has_no_expense_ratio() {
+        // R2: the 1.00x daily benchmark must equal buy & hold
+        let data = gbm_data(5.0, 0.08, 0.2, 20.0, 0.03, 0.0, 1);
+        let res = run_backtest(&data, &RollConfig { target_exposure: 1.0, ..RollConfig::default() }).unwrap();
+        let (a, b) = (res.benchmarks[0].1.last().unwrap().1, res.benchmarks[1].1.last().unwrap().1);
+        assert!((a - b).abs() < 1e-9 * a, "{a} vs {b}");
+        assert_eq!(res.benchmarks.len(), 3);
+    }
+
+    #[test]
+    fn exposure_matched_benchmark_tracks_deep_itm() {
+        // deep ITM, no costs, r = q = 0: options ≈ linear ⇒ strategy ≈ exposure-matched curve
+        let data = gbm_data(8.0, 0.08, 0.18, 18.0, 0.0, 0.0, 17);
+        let cfg = RollConfig {
+            strike: StrikeSelection::Moneyness(0.3),
+            target_exposure: 1.3,
+            costs: CostModel::zero(),
+            option_rate_spread: 0.0,
+            exec_lag_days: 0,
+            ..RollConfig::default()
+        };
+        let res = run_backtest(&data, &cfg).unwrap();
+        let m = &res.benchmark_stats[2].1;
+        assert!((res.stats.cagr - m.cagr).abs() < 0.004, "{} vs {}", res.stats.cagr, m.cagr);
+    }
+
+    #[test]
+    fn exec_lag_delays_trades() {
+        let data = gbm_data(4.0, 0.08, 0.2, 20.0, 0.02, 0.0, 12);
+        let c0 = RollConfig { exec_lag_days: 0, ..RollConfig::default() };
+        let c1 = RollConfig { exec_lag_days: 1, ..RollConfig::default() };
+        let r0 = run_backtest(&data, &c0).unwrap();
+        let r1 = run_backtest(&data, &c1).unwrap();
+        let dates = data.prices.dates();
+        assert_eq!(r0.trades[0].date, dates[0]);
+        assert_eq!(r1.trades[0].date, dates[1]);
+        // first scheduled roll happens exactly one trading day later
+        let roll0 = r0.trades.iter().find(|t| t.action == TradeAction::Roll).unwrap().date;
+        let roll1 = r1.trades.iter().find(|t| t.action == TradeAction::Roll).unwrap().date;
+        let k = dates.iter().position(|d| *d == roll0).unwrap();
+        assert_eq!(roll1, dates[k + 1]);
+        assert!(r1.records[0].contracts == 0.0 && r1.records[1].contracts > 0.0);
+    }
+
+    #[test]
+    fn crisis_spreads_cost_more() {
+        let calm = gbm_data(5.0, 0.08, 0.2, 18.0, 0.02, 0.0, 5);
+        let mut wild = calm.clone();
+        wild.vol_index = ScalarSeries::new("VOL", wild.vol_index.points.iter().map(|p| (p.0, 50.0)).collect());
+        let cfg = RollConfig { vol_model: SynthVolModel::spy(), ..RollConfig::default() };
+        let a = run_backtest(&wild, &cfg).unwrap();
+        let b = run_backtest(&wild, &RollConfig { costs: cfg.costs.without_crisis_widening(), ..cfg.clone() }).unwrap();
+        assert!(a.total_costs > 1.5 * b.total_costs, "{} vs {}", a.total_costs, b.total_costs);
     }
 
     #[test]

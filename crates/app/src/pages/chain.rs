@@ -271,10 +271,61 @@ impl ChainPage {
                 }))
             })))
             .when(self.chain.is_some(), |d| {
-                d.child(chip("to-lab", "→ 策略實驗室", false, cx).on_click(cx.listener(|this, _, _, cx| {
-                    this.state.update(cx, |st, cx| st.navigate(Page::Strategy, cx));
-                })))
+                d.child(chip("save-snap", "存成快照", false, cx).on_click(cx.listener(|this, _, _, cx| this.save_snapshot(cx))))
+                    .child(chip("export-csv", "匯出 CSV", false, cx).on_click(cx.listener(|this, _, window, cx| this.export_csv(window, cx))))
+                    .child(chip("to-lab", "→ 策略實驗室", false, cx).on_click(cx.listener(|this, _, _, cx| {
+                        this.state.update(cx, |st, cx| st.navigate(Page::Strategy, cx));
+                    })))
             })
+    }
+
+    fn save_snapshot(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = self.chain.clone() else { return };
+        let svc = self.state.read(cx).svc.clone();
+        let res = svc.store().save_chain(&c);
+        self.state.update(cx, |st, cx| match res {
+            Ok(p) => st.set_status(StatusLevel::Ok, format!("已儲存快照：{}", p.display()), cx),
+            Err(e) => st.set_status(StatusLevel::Error, format!("儲存快照失敗：{e:#}"), cx),
+        });
+    }
+
+    fn export_csv(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.chain.clone() else { return };
+        let svc = self.state.read(cx).svc.clone();
+        let dir = svc.store().root().join("exports");
+        let path = dir.join(format!("{}_{}_{}.csv", c.underlying, c.as_of.format("%Y%m%d_%H%M"), c.source));
+        let mut out = String::from("contract,underlying,underlying_price,expiry,strike,type,bid,ask,last,volume,open_interest,iv,delta,gamma,theta,vega\n");
+        let o = |v: Option<f64>| v.map(|x| format!("{x:.6}")).unwrap_or_default();
+        for q in &c.quotes {
+            out.push_str(&format!(
+                "{},{},{:.4},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                q.contract,
+                c.underlying,
+                c.spot,
+                q.expiry,
+                q.strike,
+                if q.kind == OptionKind::Call { "call" } else { "put" },
+                q.bid,
+                q.ask,
+                q.last,
+                q.volume,
+                q.open_interest,
+                o(q.iv),
+                o(q.delta),
+                o(q.gamma),
+                o(q.theta),
+                o(q.vega)
+            ));
+        }
+        let res = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, out));
+        match res {
+            Ok(()) => {
+                let ps = path.display().to_string();
+                self.csv_path.update(cx, |s, cx| s.set_value(ps.clone(), window, cx));
+                self.state.update(cx, |st, cx| st.set_status(StatusLevel::Ok, format!("已匯出 CSV：{ps}（可用「CSV 檔案路徑」重新匯入）"), cx));
+            }
+            Err(e) => self.state.update(cx, |st, cx| st.set_status(StatusLevel::Error, format!("匯出失敗：{e}"), cx)),
+        }
     }
 
     fn render_expiries(&self, c: &OptionChain, cx: &mut Context<Self>) -> impl IntoElement {

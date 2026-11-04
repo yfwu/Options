@@ -422,7 +422,7 @@ impl BacktestPage {
     fn stats_table(&self, res: &BacktestResult, cx: &mut Context<Self>) -> impl IntoElement {
         let mut cols = vec![Col::new("指標", 130.0).left(), Col::new("LEAPS 滾動", 110.0)];
         for (n, _) in &res.benchmark_stats {
-            cols.push(Col::new(n.clone(), 120.0));
+            cols.push(Col::new(n.clone(), 150.0));
         }
         type F = fn(&PerformanceStats) -> String;
         let rows: Vec<(&str, F, bool)> = vec![
@@ -556,7 +556,7 @@ impl BacktestPage {
             .child(kpi("Sharpe / Sortino", format!("{} / {}", f2(s.sharpe), f2(s.sortino)), None, cx))
             .child(kpi("平均曝險", format!("{:.2}x", res.avg_exposure), None, cx))
             .child(kpi("滾動次數 / 年", format!("{} / {:.1}", res.n_rolls, res.n_rolls as f64 / years.max(0.1)), None, cx));
-        let extra = panel("持有成本分析 Carry", cx).w(px(300.0)).flex_none().child(
+        let extra = panel("持有成本分析 Carry", cx).flex_1().min_w(px(260.0)).child(
             panel_body()
                 .child(kv("期間", format!("{} → {} ({:.1} 年)", s.start, s.end, years), cx))
                 .child(kv("波動率指數", self.vol_name.clone(), cx))
@@ -599,9 +599,9 @@ impl BacktestPage {
                     .gap_2()
                     .items_start()
                     .child(panel("績效統計 (vs 基準)", cx).flex_none().child(self.stats_table(&res, cx)))
-                    .child(extra)
-                    .child(panel("年度報酬", cx).flex_1().h(px(420.0)).child(div().flex_1().min_h_0().p_1().child(xy_chart(ch.yearly.clone())))),
+                    .child(extra),
             )
+            .child(panel("年度報酬 (LEAPS vs 買進持有)", cx).h(px(240.0)).child(div().flex_1().min_h_0().p_1().child(xy_chart(ch.yearly.clone()))))
             .child(panel(format!("交易紀錄 ({} 筆)", res.trades.len()), cx).child(div().id("trades-h").overflow_x_scroll().child(self.trades_table(&res, cx))))
             .into_any_element()
     }

@@ -6,7 +6,9 @@
 //!
 //! ```text
 //! σ_short       = vol_index/100 · iv_scale                       (≈ 1-month ATM IV)
-//! σ_ATM(T)      = σ_LR + (σ_short − σ_LR) · (1 − e^{−κT}) / (κT)  (mean-reverting term structure)
+//! W(κ, T)       = (1 − e^{−κT}) / (κT)
+//! σ_ATM(T)      = σ_LR + (σ_short − σ_LR) · [w·W(κ_f,T) + (1−w)·W(κ_s,T)]  (two-factor term structure,
+//!                 default κ_f = 4, κ_s = 0.5, w = 0.75; legacy single-κ: W(kappa,T))
 //! x             = ln(K/S) / √T                                   (time-scaled log-moneyness)
 //! m             = clamp(√(skew_ref_vol / σ_ATM(T)), 0.7, 1.5)    (skew is steeper when vol is low)
 //! σ(K, T)       = σ_ATM(T) + m · (−skew_slope · x + smile_curv · x²)   (x < 0)
@@ -17,6 +19,17 @@
 //! higher IV (equity put skew); a deep in-the-money LEAPS call (e.g. K/S = 0.85 at
 //! 18 months) therefore prices at roughly ATM + 4 vol points, which is in line
 //! with SPY/SPX quotes.
+//!
+//! ## Term structure calibration ([`TermModel`])
+//! A single reversion speed cannot fit both the steep contango of calm markets and
+//! the deep inversion of crises. Two factors (75% of a vol shock decays fast, 25%
+//! slowly) give, for SPY: σ3m/σ1m = 1.13 / 1.01 / 0.92 / 0.86 at VIX 12 / 20 / 40 / 82.7
+//! (CBOE VIX3M/VIX bucket averages: 1.18 / 1.13 / 1.08 / 0.99 / 0.87 for VIX <15 /
+//! 15–20 / 20–30 / 30–45 / >45 — mid-regime contango is somewhat too flat), and at
+//! VIX 82.7 (2020-03-16) 1y / 1.5y ATM ≈ 40% / 36% (market ≈ 30–40% for 1y SPX),
+//! versus 54% / 48% for the legacy κ = 1 model, which over-priced LEAPS in crises
+//! (shallower drawdowns, inflated option "edge"). Select the old model with
+//! `TermModel::SingleKappa` for comparisons.
 //!
 //! Notes / simplifications (documented on purpose):
 //! * VIX is a 30-day variance-swap rate, which sits above 30-day ATM IV because it
@@ -37,6 +50,34 @@ use crate::pricing::{bs_greeks, strike_for_delta, Greeks};
 /// Upside (x > 0) skew slope as a fraction of `skew_slope`: equity call wings are flatter.
 pub const CALL_WING_FACTOR: f64 = 0.5;
 
+/// ATM term-structure model of [`SynthVolModel`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum TermModel {
+    /// Legacy single-speed mean reversion with `SynthVolModel::kappa` (κ = 1 in the
+    /// presets): too sticky to the vol index in crises.
+    SingleKappa,
+    /// Two-factor reversion: `fast_weight` of the shock reverts at `fast_kappa`, the
+    /// rest at `slow_kappa` (per year).
+    TwoFactor { fast_kappa: f64, slow_kappa: f64, fast_weight: f64 },
+}
+
+impl Default for TermModel {
+    /// Calibrated two-factor model (κ_f 4, κ_s 0.5, w 0.75). See module docs.
+    fn default() -> Self {
+        TermModel::TwoFactor { fast_kappa: 4.0, slow_kappa: 0.5, fast_weight: 0.75 }
+    }
+}
+
+#[inline]
+fn reversion_weight(kappa: f64, t: f64) -> f64 {
+    let kt = kappa * t;
+    if kt < 1e-8 {
+        1.0
+    } else {
+        (1.0 - (-kt).exp()) / kt
+    }
+}
+
 /// Implied-volatility surface driven by a volatility index. See module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SynthVolModel {
@@ -44,8 +85,12 @@ pub struct SynthVolModel {
     pub iv_scale: f64,
     /// Long-run ATM implied volatility the term structure reverts to (decimal).
     pub long_run_vol: f64,
-    /// Term-structure mean-reversion speed per year (higher ⇒ long-dated IV hugs σ_LR).
+    /// Term-structure mean-reversion speed per year for [`TermModel::SingleKappa`]
+    /// (higher ⇒ long-dated IV hugs σ_LR). Ignored by the two-factor model.
     pub kappa: f64,
+    /// ATM term-structure model (default: calibrated two-factor).
+    #[serde(default)]
+    pub term_model: TermModel,
     /// IV change per unit of time-scaled log-moneyness `ln(K/S)/√T` (positive ⇒ put skew).
     pub skew_slope: f64,
     /// Smile curvature on `x²` (small, positive).
@@ -69,6 +114,7 @@ impl SynthVolModel {
             iv_scale: 0.90,
             long_run_vol: 0.195,
             kappa: 1.0,
+            term_model: TermModel::default(),
             skew_slope: 0.30,
             smile_curv: 0.05,
             skew_ref_vol: 0.18,
@@ -86,6 +132,7 @@ impl SynthVolModel {
             iv_scale: 0.92,
             long_run_vol: 0.235,
             kappa: 1.0,
+            term_model: TermModel::default(),
             skew_slope: 0.25,
             smile_curv: 0.05,
             skew_ref_vol: 0.22,
@@ -97,14 +144,25 @@ impl SynthVolModel {
     pub fn ndx() -> Self {
         Self::qqq()
     }
+    /// Same surface with a different term-structure model (e.g. `TermModel::SingleKappa`
+    /// to reproduce the legacy κ = 1 behaviour).
+    pub fn with_term_model(mut self, term_model: TermModel) -> Self {
+        self.term_model = term_model;
+        self
+    }
 
     /// ATM implied vol for maturity `t` (years) given the vol index in points (e.g. 18.5).
     #[inline]
     pub fn atm_vol(&self, t: f64, vol_index_pts: f64) -> f64 {
         let t = t.max(1.0 / 365.0);
         let short = (vol_index_pts / 100.0 * self.iv_scale).max(0.0);
-        let kt = self.kappa * t;
-        let w = if kt < 1e-8 { 1.0 } else { (1.0 - (-kt).exp()) / kt };
+        let w = match self.term_model {
+            TermModel::SingleKappa => reversion_weight(self.kappa, t),
+            TermModel::TwoFactor { fast_kappa, slow_kappa, fast_weight } => {
+                let fw = fast_weight.clamp(0.0, 1.0);
+                fw * reversion_weight(fast_kappa, t) + (1.0 - fw) * reversion_weight(slow_kappa, t)
+            }
+        };
         (self.long_run_vol + (short - self.long_run_vol) * w).clamp(self.min_vol, self.max_vol)
     }
 
@@ -235,8 +293,19 @@ pub fn fast_bs_greeks(kind: OptionKind, s: f64, k: f64, t: f64, r: f64, q: f64, 
 /// Transaction-cost model for option trades.
 ///
 /// A buy fills at `mid + half_spread + slippage·mid`, a sell at
-/// `mid − half_spread − slippage·mid`, where `half_spread = max(half_spread_pct·mid,
-/// min_half_spread)`. Commission is charged per contract on every leg.
+/// `mid − half_spread − slippage·mid`, where
+/// `half_spread = max(half_spread_pct·mid, min_half_spread) · m(vol)` and the crisis
+/// multiplier `m(vol) = (vol / crisis_ref_vol)^crisis_exp` when the vol index is above
+/// `crisis_ref_vol` (1 otherwise; `crisis_ref_vol = 0` disables widening). Commission is
+/// charged per contract on every leg.
+///
+/// Default half spreads (calm markets, working limit orders near mid) for long-dated
+/// 0.7–0.9Δ calls: SPY 0.6%, QQQ 0.75%, SPX 0.4%. Rationale: SPY/QQQ Jan LEAPS on a
+/// $100–200 premium typically quote $1–3 wide (0.3–1% half spread); the only real long
+/// dated chain available for validation (DOV, an illiquid single stock) showed 4.4%,
+/// which is an upper bound, not representative of SPY/QQQ. Use
+/// [`CostModel::conservative`] (1% + 0.25% slippage, stronger crisis widening) for
+/// sensitivity checks.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CostModel {
     /// Half of the bid/ask spread as a fraction of the option mid (0.005 = 0.5%).
@@ -247,6 +316,12 @@ pub struct CostModel {
     pub commission_per_contract: f64,
     /// Extra adverse fill as a fraction of mid (market impact / not getting mid-ish fills).
     pub slippage: f64,
+    /// Vol-index level (points) above which spreads widen; 0 disables widening.
+    #[serde(default)]
+    pub crisis_ref_vol: f64,
+    /// Exponent of the widening: half spread × (vol/ref)^exp above the reference.
+    #[serde(default)]
+    pub crisis_exp: f64,
 }
 
 impl Default for CostModel {
@@ -256,29 +331,42 @@ impl Default for CostModel {
 }
 
 impl CostModel {
-    /// SPY LEAPS: deep ITM 1–2y calls typically quote $0.6–2.0 wide on a $100–200
-    /// option ⇒ ~0.5% half spread when working limit orders near mid.
+    /// SPY LEAPS: 0.6% half spread, widening linearly with VIX above 25.
     pub fn spy() -> Self {
-        Self { half_spread_pct: 0.005, min_half_spread: 0.05, commission_per_contract: 0.65, slippage: 0.0 }
+        Self { half_spread_pct: 0.006, min_half_spread: 0.05, commission_per_contract: 0.65, slippage: 0.0, crisis_ref_vol: 25.0, crisis_exp: 1.0 }
     }
-    /// QQQ LEAPS: slightly wider than SPY.
+    /// QQQ LEAPS: 0.75% half spread, widening linearly with VXN above 30 (VXN ≈ 1.17×VIX).
     pub fn qqq() -> Self {
-        Self { half_spread_pct: 0.006, min_half_spread: 0.05, commission_per_contract: 0.65, slippage: 0.0 }
+        Self { half_spread_pct: 0.0075, min_half_spread: 0.05, commission_per_contract: 0.65, slippage: 0.0, crisis_ref_vol: 30.0, crisis_exp: 1.0 }
     }
     /// SPX LEAPS: wide in dollars but tighter in percent; higher per-contract fees.
     pub fn spx() -> Self {
-        Self { half_spread_pct: 0.003, min_half_spread: 0.10, commission_per_contract: 1.50, slippage: 0.0 }
+        Self { half_spread_pct: 0.004, min_half_spread: 0.10, commission_per_contract: 1.50, slippage: 0.0, crisis_ref_vol: 25.0, crisis_exp: 1.0 }
     }
     /// Zero costs (for research / invariance tests).
     pub fn zero() -> Self {
-        Self { half_spread_pct: 0.0, min_half_spread: 0.0, commission_per_contract: 0.0, slippage: 0.0 }
+        Self { half_spread_pct: 0.0, min_half_spread: 0.0, commission_per_contract: 0.0, slippage: 0.0, crisis_ref_vol: 0.0, crisis_exp: 0.0 }
     }
-    /// Conservative: 1% half spread plus 0.25% slippage (illiquid strikes, market orders).
+    /// Conservative: 1% half spread plus 0.25% slippage, spreads ∝ (vol/25)^1.5 in crises.
     pub fn conservative() -> Self {
-        Self { half_spread_pct: 0.01, min_half_spread: 0.05, commission_per_contract: 0.65, slippage: 0.0025 }
+        Self { half_spread_pct: 0.01, min_half_spread: 0.05, commission_per_contract: 0.65, slippage: 0.0025, crisis_ref_vol: 25.0, crisis_exp: 1.5 }
+    }
+    /// Copy without crisis widening (legacy behaviour).
+    pub fn without_crisis_widening(mut self) -> Self {
+        self.crisis_ref_vol = 0.0;
+        self
     }
 
-    /// Half spread in dollars per share for a given mid.
+    /// Spread multiplier for a vol-index level (points); 1 in calm markets.
+    #[inline]
+    pub fn crisis_mult(&self, vol_index_pts: f64) -> f64 {
+        if self.crisis_ref_vol > 0.0 && vol_index_pts > self.crisis_ref_vol {
+            (vol_index_pts / self.crisis_ref_vol).powf(self.crisis_exp)
+        } else {
+            1.0
+        }
+    }
+    /// Half spread in dollars per share for a given mid (no crisis widening).
     #[inline]
     pub fn half_spread(&self, mid: f64) -> f64 {
         if mid <= 0.0 {
@@ -286,15 +374,30 @@ impl CostModel {
         }
         (self.half_spread_pct * mid).max(self.min_half_spread)
     }
-    /// Fill price when buying.
+    /// Half spread including crisis widening at vol-index level `vol_index_pts`.
+    #[inline]
+    pub fn half_spread_at(&self, mid: f64, vol_index_pts: f64) -> f64 {
+        self.half_spread(mid) * self.crisis_mult(vol_index_pts)
+    }
+    /// Fill price when buying (no crisis widening).
     #[inline]
     pub fn buy_price(&self, mid: f64) -> f64 {
         mid + self.half_spread(mid) + self.slippage * mid
     }
-    /// Fill price when selling (never negative).
+    /// Fill price when selling (never negative, no crisis widening).
     #[inline]
     pub fn sell_price(&self, mid: f64) -> f64 {
         (mid - self.half_spread(mid) - self.slippage * mid).max(0.0)
+    }
+    /// Fill price when buying at vol-index level `vol_index_pts`.
+    #[inline]
+    pub fn buy_price_at(&self, mid: f64, vol_index_pts: f64) -> f64 {
+        mid + self.half_spread_at(mid, vol_index_pts) + self.slippage * mid
+    }
+    /// Fill price when selling at vol-index level `vol_index_pts` (never negative).
+    #[inline]
+    pub fn sell_price_at(&self, mid: f64, vol_index_pts: f64) -> f64 {
+        (mid - self.half_spread_at(mid, vol_index_pts) - self.slippage * mid).max(0.0)
     }
 }
 
@@ -311,6 +414,61 @@ mod tests {
         assert!(m.atm_vol(2.0, 11.0) > m.atm_vol(0.08, 11.0));
         // short end ~ index * scale
         assert!((m.atm_vol(1.0 / 365.0, 20.0) - 0.18).abs() < 0.002);
+    }
+
+    #[test]
+    fn two_factor_crisis_long_end() {
+        let m = SynthVolModel::spy();
+        let (y1, y15) = (m.atm_vol(1.0, 82.7), m.atm_vol(1.5, 82.7));
+        assert!((0.37..0.43).contains(&y1), "{y1}");
+        assert!((0.33..0.39).contains(&y15), "{y15}");
+        let old = m.with_term_model(TermModel::SingleKappa);
+        assert!(old.atm_vol(1.0, 82.7) > 0.52);
+        // calm: contango, VIX 20: roughly flat
+        let r = |v: f64| m.atm_vol(0.25, v) / m.atm_vol(1.0 / 12.0, v);
+        assert!(r(12.0) > 1.08 && (0.97..1.05).contains(&r(20.0)) && r(82.7) < 0.9, "{} {} {}", r(12.0), r(20.0), r(82.7));
+    }
+
+    /// Calibration check against CBOE VIX3M/VIX (bundled data; skipped if absent).
+    #[test]
+    fn two_factor_fits_vix3m_better() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let read = |f: &str| -> Option<std::collections::HashMap<chrono::NaiveDate, f64>> {
+            let txt = std::fs::read_to_string(dir.join(f)).ok()?;
+            Some(
+                txt.lines()
+                    .skip(1)
+                    .filter_map(|l| {
+                        let c: Vec<&str> = l.split(',').collect();
+                        let d = chrono::NaiveDate::parse_from_str(c.first()?.trim(), "%m/%d/%Y").ok()?;
+                        Some((d, c.get(4)?.trim().parse::<f64>().ok()?))
+                    })
+                    .collect(),
+            )
+        };
+        let (Some(vix), Some(v3)) = (read("VIX_History.csv"), read("VIX3M_History.csv")) else {
+            return;
+        };
+        let pairs: Vec<(f64, f64)> = v3.iter().filter_map(|(d, b)| vix.get(d).map(|a| (*a, *b))).collect();
+        assert!(pairs.len() > 3000);
+        let buckets = [(0.0, 15.0), (15.0, 20.0), (20.0, 30.0), (30.0, 45.0), (45.0, 200.0)];
+        let sse = |m: &SynthVolModel| {
+            let (mut e, mut worst) = (0.0, 0.0f64);
+            for (lo, hi) in buckets {
+                let b: Vec<&(f64, f64)> = pairs.iter().filter(|p| p.0 >= lo && p.0 < hi).collect();
+                let actual = b.iter().map(|p| p.1 / p.0).sum::<f64>() / b.len() as f64;
+                let vbar = b.iter().map(|p| p.0).sum::<f64>() / b.len() as f64;
+                let model = m.atm_vol(0.25, vbar) / m.atm_vol(1.0 / 12.0, vbar);
+                worst = worst.max((model - actual).abs());
+                e += (model - actual).powi(2);
+            }
+            (e, worst)
+        };
+        let two = SynthVolModel::spy();
+        let one = two.with_term_model(TermModel::SingleKappa);
+        let ((e2, w2), (e1, _)) = (sse(&two), sse(&one));
+        assert!(e2 < e1 * 0.8, "{e2} vs {e1}");
+        assert!(w2 < 0.11, "worst bucket error {w2}");
     }
 
     #[test]
@@ -373,6 +531,11 @@ mod tests {
         let c = CostModel::spy();
         assert!(c.buy_price(100.0) > 100.0 && c.sell_price(100.0) < 100.0);
         assert!((c.half_spread(1.0) - 0.05).abs() < 1e-12);
+        // crisis widening
+        assert_eq!(c.half_spread_at(100.0, 20.0), c.half_spread(100.0));
+        assert!((c.half_spread_at(100.0, 50.0) - 2.0 * c.half_spread(100.0)).abs() < 1e-12);
+        assert!(c.sell_price_at(100.0, 80.0) < c.sell_price(100.0));
+        assert_eq!(c.without_crisis_widening().half_spread_at(100.0, 80.0), c.half_spread(100.0));
         assert_eq!(CostModel::zero().buy_price(10.0), 10.0);
         assert_eq!(c.sell_price(0.01), 0.0);
     }

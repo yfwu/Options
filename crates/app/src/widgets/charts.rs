@@ -956,11 +956,19 @@ fn paint_xy(spec: &ChartSpec, bounds: Bounds<Pixels>, window: &mut Window, cx: &
             }
         }
     }
+    let mut k = 0usize;
     for l in &spec.vlines {
         if let Some(lbl) = &l.label {
             let x = m.tx(l.value);
             if x >= pl && x <= pr {
-                paint_text(lbl, point(px(x + 3.0), px(pt + 2.0)), 10.0, l.color, Align::Left, false, window, cx);
+                let y = pt + 20.0 + 13.0 * (k % 4) as f32;
+                let w = text_width(lbl, 10.0, false, window, cx);
+                if x + 3.0 + w > pr {
+                    paint_text(lbl, point(px(x - 3.0), px(y)), 10.0, l.color, Align::Right, false, window, cx);
+                } else {
+                    paint_text(lbl, point(px(x + 3.0), px(y)), 10.0, l.color, Align::Left, false, window, cx);
+                }
+                k += 1;
             }
         }
     }

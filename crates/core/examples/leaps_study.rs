@@ -1,30 +1,35 @@
-//! LEAPS roll study on the bundled historical data.
+//! LEAPS roll study on the bundled historical data (with before/after attribution
+//! of the engine-validation fixes).
 //!
 //! ```text
-//! cargo run --release -p optlab-core --example leaps_study [-- --quick]
+//! cargo run --release -p optlab-core --example leaps_study [-- --quick] [-- --advise] [-- --kb]
 //! ```
 //!
-//! Data (in `<workspace>/data`):
-//! * `QQQ_adj_1999.csv` (Date,adj_close) + `VXN_History.csv` (from 2009-09) + `VIX_History.csv`.
-//!   Before VXN exists the QQQ vol index is a **proxy**:
-//!   `max(VIX × ratio, 1.10 × RV21(QQQ))`, where `ratio` is the median VXN/VIX
-//!   over the overlap (≈1.2–1.3). The realised-vol floor matters in 2000–2002, when
-//!   Nasdaq vol was ~2× SPX vol and a plain VIX ratio would make QQQ LEAPS far too cheap.
-//! * `VIX_SPY_1993.csv` (Date,VIX,SPY adj close) for SPY.
-//! * Rates: built-in approximate 3M T-bill history (`approx_us_tbill_rates`).
-//!
-//! The CSV parsing here is deliberately self-contained (no optlab-data dependency).
+//! Data (in `<workspace>/data`), parsed here without the optlab-data crate:
+//! * QQQ: `QQQ_adj_1999.csv` (total-return adj close). Vol index = CBOE `VXN_History.csv`
+//!   (2009-09 →), Barchart `VXN_barchart_2000.csv` (2000-10-10 → 2009-09) and, before
+//!   that, `VIX × 2.13` (the 2000–2002 VXN/VIX ratio; same rule as `optlab_data::presets`).
+//! * SPY: `VIX_SPY_1993.csv` (VIX, SPY adj close).
+//! * Rates: FRED `DGS3MO.csv` (3M T-bill, percent).
+//! * "Legacy" inputs (for attribution only): the old QQQ proxy
+//!   `max(VIX × median VXN/VIX, 1.1 × RV21)` before 2009-09 and the approximate T-bill table.
 
 use chrono::NaiveDate;
 use optlab_core::advisor::{advise, strategy_conclusions, MarketSnapshot};
 use optlab_core::backtest::{approx_us_tbill_rates, run_backtest, BacktestData, BacktestResult, RateSource, RollConfig, StrikeSelection};
 use optlab_core::chain::OptionKind;
 use optlab_core::history::{Bar, PriceSeries, ScalarSeries};
-use optlab_core::optimize::{bootstrap_robustness, optimize, sensitivity, walk_forward, walk_forward_summary, Objective, ParamGrid, SweepParam};
+use optlab_core::optimize::{
+    bootstrap_robustness, optimize, optimize_robust, sensitivity, walk_forward, walk_forward_summary, Objective, OptRow, ParamGrid, RobustOptions,
+    SweepParam,
+};
 use optlab_core::stats::PerformanceStats;
-use optlab_core::synth::SynthVolModel;
+use optlab_core::synth::{CostModel, SynthVolModel, TermModel};
 use std::path::PathBuf;
 use std::time::Instant;
+
+/// VXN/VIX ratio used before Barchart VXN starts (2000-10-10), as in optlab-data.
+const VXN_VIX_EARLY: f64 = 2.13;
 
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
@@ -35,8 +40,8 @@ fn parse_date(s: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(s, "%Y-%m-%d").ok().or_else(|| NaiveDate::parse_from_str(s, "%m/%d/%Y").ok())
 }
 
-/// Read (date, column) pairs from a simple CSV with a header.
-fn read_col(file: &str, col: usize) -> Vec<(NaiveDate, f64)> {
+/// Read (date, column) pairs from a simple CSV with a header; keeps values ≥ `min`.
+fn read_col_min(file: &str, col: usize, min: f64) -> Vec<(NaiveDate, f64)> {
     let txt = std::fs::read_to_string(data_dir().join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
     txt.lines()
         .skip(1)
@@ -44,8 +49,12 @@ fn read_col(file: &str, col: usize) -> Vec<(NaiveDate, f64)> {
             let f: Vec<&str> = l.split(',').collect();
             Some((parse_date(f.first()?)?, f.get(col)?.trim().parse::<f64>().ok()?))
         })
-        .filter(|p| p.1.is_finite() && p.1 > 0.0)
+        .filter(|p| p.1.is_finite() && p.1 >= min)
         .collect()
+}
+
+fn read_col(file: &str, col: usize) -> Vec<(NaiveDate, f64)> {
+    read_col_min(file, col, 1e-12)
 }
 
 fn series_from(name: &str, pts: &[(NaiveDate, f64)]) -> PriceSeries {
@@ -53,16 +62,33 @@ fn series_from(name: &str, pts: &[(NaiveDate, f64)]) -> PriceSeries {
     PriceSeries::new(name, bars)
 }
 
-fn qqq_data() -> (BacktestData, f64) {
+fn dgs3mo() -> RateSource {
+    // zero yields (2011–2015, 2020–21) are real values: keep them
+    RateSource::Series(ScalarSeries::new("DGS3MO", read_col_min("DGS3MO.csv", 1, 0.0)))
+}
+
+/// QQQ with real VXN (CBOE + Barchart) and DGS3MO rates.
+fn qqq_data() -> BacktestData {
+    let qqq = read_col("QQQ_adj_1999.csv", 1);
+    let cboe = read_col("VXN_History.csv", 4);
+    let barchart = read_col("VXN_barchart_2000.csv", 4);
+    let vix = ScalarSeries::new("VIX", read_col("VIX_History.csv", 4));
+    let (bc0, cb0) = (barchart[0].0, cboe[0].0);
+    let mut pts: Vec<(NaiveDate, f64)> = qqq.iter().filter(|p| p.0 < bc0).map(|&(d, _)| (d, vix.value_at(d).unwrap_or(25.0) * VXN_VIX_EARLY)).collect();
+    pts.extend(barchart.iter().copied().filter(|p| p.0 < cb0));
+    pts.extend(cboe.iter().copied());
+    BacktestData::new(series_from("QQQ", &qqq), ScalarSeries::new("VXN", pts), dgs3mo(), 0.006)
+}
+
+/// Legacy QQQ inputs (old proxy before 2009-09, approximate rate table, q = 0.7%).
+fn qqq_data_legacy() -> BacktestData {
     let qqq = read_col("QQQ_adj_1999.csv", 1);
     let vxn = ScalarSeries::new("VXN", read_col("VXN_History.csv", 4));
     let vix = ScalarSeries::new("VIX", read_col("VIX_History.csv", 4));
-    // overlap ratio
     let mut ratios: Vec<f64> = vxn.points.iter().filter_map(|&(d, v)| vix.value_at(d).map(|x| v / x)).collect();
     ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let ratio = ratios[ratios.len() / 2];
     let first_vxn = vxn.points[0].0;
-    // RV21 of QQQ
     let lr: Vec<f64> = qqq.windows(2).map(|w| (w[1].1 / w[0].1).ln()).collect();
     let mut pts = Vec::new();
     for (i, &(d, _)) in qqq.iter().enumerate() {
@@ -76,18 +102,30 @@ fn qqq_data() -> (BacktestData, f64) {
         } else {
             0.0
         };
-        let v = vix.value_at(d).unwrap_or(20.0) * ratio;
-        pts.push((d, v.max(1.10 * rv)));
+        pts.push((d, (vix.value_at(d).unwrap_or(20.0) * ratio).max(1.10 * rv)));
     }
     pts.extend(vxn.points.iter().copied());
-    let vol = ScalarSeries::new("VXN (VIX/RV proxy before 2009-09)", pts);
-    (BacktestData::new(series_from("QQQ", &qqq), vol, RateSource::Series(approx_us_tbill_rates()), 0.007), ratio)
+    BacktestData::new(series_from("QQQ", &qqq), ScalarSeries::new("VXN proxy", pts), RateSource::Series(approx_us_tbill_rates()), 0.007)
 }
 
 fn spy_data() -> BacktestData {
     let spy = read_col("VIX_SPY_1993.csv", 2);
     let vix = ScalarSeries::new("VIX", read_col("VIX_SPY_1993.csv", 1));
-    BacktestData::new(series_from("SPY", &spy), vix, RateSource::Series(approx_us_tbill_rates()), 0.017)
+    BacktestData::new(series_from("SPY", &spy), vix, dgs3mo(), 0.014)
+}
+
+fn spy_data_legacy() -> BacktestData {
+    BacktestData { rate: RateSource::Series(approx_us_tbill_rates()), dividend_yield: 0.017, ..spy_data() }
+}
+
+/// Engine behaviour before the validation fixes: κ = 1 term structure, no crisis
+/// spread widening, same-close execution, old half spreads (SPY 0.5%, QQQ 0.6%).
+fn legacy(mut c: RollConfig, old_half_spread: f64) -> RollConfig {
+    c.vol_model = c.vol_model.with_term_model(TermModel::SingleKappa);
+    c.costs = c.costs.without_crisis_widening();
+    c.costs.half_spread_pct = old_half_spread;
+    c.exec_lag_days = 0;
+    c
 }
 
 fn pct(x: f64) -> String {
@@ -110,238 +148,238 @@ fn line(name: &str, s: &PerformanceStats) {
 
 fn report(r: &BacktestResult, ms: f64) {
     println!(
-        "  [{}] {} → {} ({:.1}y) | rolls {} | costs ${:.0} (drag {:.2}%/yr of equity) | avg exposure {:.2}x | entry extrinsic {:.2}%/yr of spot, {:.2}%/yr of Δ-notional | theta {:.2}%/yr of equity | avg rf {:.2}% | {:.2} ms{}",
-        r.config.label(),
+        "  [{}] {} → {} ({:.1}y) | rolls {} | cost drag {:.2}%/yr | avg exposure {:.2}x | min equity {:.1}%{} | entry extrinsic {:.2}%/yr of spot | {:.2} ms",
+        r.label(),
         r.stats.start,
         r.stats.end,
         r.stats.years,
         r.n_rolls,
-        r.total_costs,
         r.cost_drag_annual * 100.0,
         r.avg_exposure,
+        r.min_equity_ratio * 100.0,
+        if r.near_wipe { " NEAR-WIPE" } else { "" },
         r.avg_extrinsic_pct_annual * 100.0,
-        r.avg_carry_pct_of_exposure * 100.0,
-        r.avg_theta_pct_equity * 100.0,
-        r.avg_rate * 100.0,
         ms,
-        if r.wiped_out { format!(" | WIPED OUT {}", r.wiped_date.unwrap()) } else { String::new() }
     );
     line("LEAPS roll", &r.stats);
     for (n, s) in &r.benchmark_stats {
         line(n, s);
     }
-    let yr = |s: &PerformanceStats, y: i32| s.yearly.iter().find(|p| p.0 == y).map_or("     -".to_string(), |p| format!("{:>6.1}", p.1 * 100.0));
-    print!("  year:      ");
-    let years = [2000, 2001, 2002, 2008, 2009, 2013, 2018, 2020, 2022, 2023, 2024];
-    for y in years {
-        print!("{y:>7}");
-    }
-    println!();
-    for (n, s) in std::iter::once(("LEAPS", &r.stats)).chain(r.benchmark_stats.iter().map(|(n, s)| (n.as_str(), s))) {
-        let short: String = n.chars().take(10).collect();
-        print!("  {short:<10} ");
-        for y in years {
-            print!(" {}", yr(s, y));
-        }
-        println!();
-    }
+    println!(
+        "  edge: vs B&H {:+.2}%/yr | vs daily L× {:+.2}%/yr | vs exposure-matched linear {:+.2}%/yr (option-specific)",
+        (r.stats.cagr - r.benchmark_stats[0].1.cagr) * 100.0,
+        (r.stats.cagr - r.benchmark_stats[1].1.cagr) * 100.0,
+        (r.stats.cagr - r.benchmark_stats[2].1.cagr) * 100.0
+    );
+}
+
+fn short(r: &BacktestResult) -> String {
+    format!(
+        "CAGR {} MDD {} minEq {:>5.1}% avgExp {:.2}x | vsB&H {:+.2} vsMatched {:+.2}",
+        pct(r.stats.cagr),
+        pct(r.stats.max_drawdown),
+        r.min_equity_ratio * 100.0,
+        r.avg_exposure,
+        (r.stats.cagr - r.benchmark_stats[0].1.cagr) * 100.0,
+        (r.stats.cagr - r.benchmark_stats[2].1.cagr) * 100.0
+    )
 }
 
 fn pricing_sanity() {
-    println!("\n=== 1. Synthetic LEAPS pricing sanity (0.80Δ, 540 DTE, S=100) ===");
-    println!("  model  vol-idx  r     K/S    IV     price%S  extrinsic%S/yr  carry%Δnotional/yr");
+    println!("\n=== 1. Synthetic pricing sanity: ATM term structure (two-factor vs legacy κ=1) and 0.80Δ 540-DTE carry ===");
+    println!("  model  vol-idx | ATM 1m   3m    1y   1.5y | legacy 1y 1.5y | 0.80Δ K/S  IV    price%S  extr%S/yr (r=4%)");
     for (name, m, q) in [("SPY", SynthVolModel::spy(), 0.013), ("QQQ", SynthVolModel::qqq(), 0.006)] {
-        for &(vix, r) in &[(12.0, 0.0), (12.0, 0.045), (17.0, 0.0), (17.0, 0.02), (17.0, 0.045), (25.0, 0.045), (40.0, 0.045), (60.0, 0.02)] {
-            let (s, t) = (100.0, 540.0 / 365.0);
-            let k = m.strike_for_delta(OptionKind::Call, 0.8, s, t, r, q, vix);
-            let (g, iv) = m.greeks(OptionKind::Call, s, k, t, r, q, vix);
+        let old = m.with_term_model(TermModel::SingleKappa);
+        for &v in &[12.0, 17.0, 25.0, 40.0, 60.0, 82.7] {
+            let (s, t, r) = (100.0, 540.0 / 365.0, 0.043);
+            let k = m.strike_for_delta(OptionKind::Call, 0.8, s, t, r, q, v);
+            let (g, iv) = m.greeks(OptionKind::Call, s, k, t, r, q, v);
             let ext = g.price - (s - k).max(0.0);
             println!(
-                "  {name}   {vix:>5.0}  {:>4.1}%  {:.3}  {:>5.1}%  {:>6.1}%  {:>8.2}%  {:>12.2}%",
-                r * 100.0,
+                "  {name}   {v:>6.1}  | {:>5.1} {:>5.1} {:>5.1} {:>5.1} | {:>5.1} {:>5.1}   | {:.3} {:>5.1}% {:>6.1}%  {:>6.2}%",
+                m.atm_vol(1.0 / 12.0, v) * 100.0,
+                m.atm_vol(0.25, v) * 100.0,
+                m.atm_vol(1.0, v) * 100.0,
+                m.atm_vol(1.5, v) * 100.0,
+                old.atm_vol(1.0, v) * 100.0,
+                old.atm_vol(1.5, v) * 100.0,
                 k / s,
                 iv * 100.0,
                 g.price,
-                ext / s / t * 100.0,
-                ext / (g.delta * s) / t * 100.0
+                ext / s / t * 100.0
             );
         }
     }
 }
 
+fn opt_line(r: &OptRow) -> String {
+    format!(
+        "score {:>7.3} (hist {:>7.3}, IQR {:.3}) | {:<44} CAGR {} MDD {} minEq {:>5.1}%{}",
+        r.score,
+        r.history_score,
+        r.score_iqr,
+        r.label(),
+        pct(r.stats.cagr),
+        pct(r.stats.max_drawdown),
+        r.min_equity_ratio * 100.0,
+        if r.exposure_ok { "" } else { " (exposure short)" }
+    )
+}
+
 fn main() {
-    let quick = std::env::args().any(|a| a == "--quick");
+    let args: Vec<String> = std::env::args().collect();
+    let quick = args.iter().any(|a| a == "--quick");
     pricing_sanity();
 
-    let (qqq, ratio) = qqq_data();
+    let qqq = qqq_data();
     let spy = spy_data();
-    println!("\nQQQ vol proxy: VXN/VIX median ratio on overlap = {ratio:.3}; before 2009-09 vol = max(VIX×{ratio:.2}, 1.1×RV21)");
+    let qqq_old = qqq_data_legacy();
+    let spy_old = spy_data_legacy();
 
-    println!("\n=== 2. Default stock-replacement backtests ===");
-    let mut defaults = Vec::new();
-    for (data, cfg) in [(&qqq, RollConfig::qqq()), (&spy, RollConfig::spy())] {
-        let t0 = Instant::now();
-        let r = run_backtest(data, &cfg).unwrap();
-        let ms = t0.elapsed().as_secs_f64() * 1e3;
+    println!("\n=== 2. Current engine (two-factor IV, crisis spreads, exec lag 1, real VXN + DGS3MO) ===");
+    for (data, base) in [(&qqq, RollConfig::qqq()), (&spy, RollConfig::spy())] {
         println!("\n{}:", data.prices.symbol);
-        report(&r, ms);
-        defaults.push(r);
-        // same config without rebalancing band and at 1.0x to see pure carry drag
-        for c in [
-            RollConfig { target_exposure: 1.0, ..cfg.clone() },
-            RollConfig { target_exposure: 2.0, ..cfg.clone() },
-            RollConfig { rebalance_band: None, ..cfg.clone() },
-        ] {
+        for e in [1.0, 1.5, 2.0] {
+            let c = RollConfig { target_exposure: e, ..base.clone() };
+            let t0 = Instant::now();
             let r = run_backtest(data, &c).unwrap();
-            println!("  variant {}:", c.label());
-            line("LEAPS roll", &r.stats);
-            line(&r.benchmark_stats[1].0, &r.benchmark_stats[1].1);
+            report(&r, t0.elapsed().as_secs_f64() * 1e3);
         }
-        // post-2009 sub-period (real VXN for QQQ)
-        let c = RollConfig { start: NaiveDate::from_ymd_opt(2009, 10, 1), ..cfg.clone() };
+        let c = RollConfig { target_exposure: 1.5, start: NaiveDate::from_ymd_opt(2009, 10, 1), ..base.clone() };
         let r = run_backtest(data, &c).unwrap();
-        println!("  sub-period from 2009-10 ({}):", c.label());
-        line("LEAPS roll", &r.stats);
-        for (n, s) in &r.benchmark_stats {
-            line(n, s);
+        println!("  from 2009-10, 1.5x: {}", short(&r));
+    }
+
+    println!("\n=== 3. Before/after attribution (1.0x and 1.5x, Δ0.80 540/180 ±25%) ===");
+    for (sym, data_new, data_old, base, old_hs) in [("QQQ", &qqq, &qqq_old, RollConfig::qqq(), 0.006), ("SPY", &spy, &spy_old, RollConfig::spy(), 0.005)] {
+        for e in [1.0, 1.5, 2.0] {
+            let b = RollConfig { target_exposure: e, ..base.clone() };
+            let l = legacy(b.clone(), old_hs);
+            let rows: Vec<(&str, &BacktestData, RollConfig)> = vec![
+                ("legacy engine + legacy data (original)", data_old, l.clone()),
+                ("legacy engine + real VXN/DGS3MO (B3/B5)", data_new, l.clone()),
+                ("  + two-factor term structure (B2)", data_new, RollConfig { vol_model: b.vol_model, ..l.clone() }),
+                ("  + crisis spreads & new half spread (B4)", data_new, RollConfig { vol_model: b.vol_model, costs: b.costs, ..l.clone() }),
+                ("  + exec lag 1 = current engine (B7)", data_new, b.clone()),
+                ("current, CostModel::conservative()", data_new, RollConfig { costs: CostModel::conservative(), ..b.clone() }),
+            ];
+            println!("{sym} {e:.1}x:");
+            for (name, d, c) in rows {
+                let r = run_backtest(d, &c).unwrap();
+                println!("  {name:<44} {}", short(&r));
+            }
         }
     }
 
-    // Timing: repeated runs
     let t0 = Instant::now();
-    let n_rep = 50;
+    let n_rep = 30;
     for _ in 0..n_rep {
         let _ = run_backtest(&spy, &RollConfig::spy()).unwrap();
     }
-    println!("\nTiming: run_backtest SPY {:.1}y full (with records & benchmarks) = {:.2} ms/run", defaults[1].stats.years, t0.elapsed().as_secs_f64() * 1e3 / n_rep as f64);
+    println!("\nTiming: run_backtest SPY 33y with records & 3 benchmarks = {:.2} ms/run", t0.elapsed().as_secs_f64() * 1e3 / n_rep as f64);
 
-    println!("\n=== 3. Grid optimisation (default grid) ===");
+    println!("\n=== 4. Optimisation: single-history argmax vs robust (median over 12 bootstrap paths + history, neighbour-smoothed) ===");
     let grid = ParamGrid::default();
-    let mut bests = Vec::new();
+    let mut bests: Vec<(&BacktestData, RollConfig, String)> = Vec::new();
     for (data, base) in [(&qqq, RollConfig::qqq()), (&spy, RollConfig::spy())] {
-        for obj in [Objective::Utility { lambda: 0.25 }, Objective::Calmar, Objective::MaxCagrWithDdCap { max_dd: 0.55 }] {
+        for obj in [Objective::Utility { lambda: 0.25 }, Objective::Calmar] {
             let t0 = Instant::now();
             let rows = optimize(data, &base, &grid, obj, None);
-            let el = t0.elapsed().as_secs_f64();
-            println!("\n{} — objective {} — {} combos in {:.2}s ({:.2} ms/run on all cores)", data.prices.symbol, obj.label(), rows.len(), el, el * 1e3 / rows.len() as f64);
-            for r in rows.iter().take(6) {
-                println!(
-                    "  score {:>7.3} | {:<32} CAGR {} MDD {} Sharpe {:>5.2} rolls {:>3} wiped {}",
-                    r.score,
-                    r.config.label(),
-                    pct(r.stats.cagr),
-                    pct(r.stats.max_drawdown),
-                    r.stats.sharpe,
-                    r.n_rolls,
-                    r.wiped_out
-                );
+            let t_plain = t0.elapsed().as_secs_f64();
+            let t0 = Instant::now();
+            let robust = optimize_robust(data, &base, &grid, obj, &RobustOptions::default(), None).unwrap();
+            let t_rob = t0.elapsed().as_secs_f64();
+            println!("\n{} — {} — {} combos (plain {:.2}s, robust {:.1}s)", data.prices.symbol, obj.label(), rows.len(), t_plain, t_rob);
+            println!("  single-history top 3:");
+            for r in rows.iter().take(3) {
+                println!("    {}", opt_line(r));
             }
-            let wiped = rows.iter().filter(|r| r.wiped_out).count();
-            println!("  ({wiped} of {} combos wiped out)", rows.len());
+            println!("  robust top 3:");
+            for r in robust.iter().take(3) {
+                println!("    {}", opt_line(r));
+            }
+            let nw = rows.iter().filter(|r| r.near_wipe).count();
+            let short_n = rows.iter().filter(|r| !r.exposure_ok).count();
+            println!("  ({nw} of {} combos near-wipe (<10% min equity), {short_n} under-exposed)", rows.len());
             if matches!(obj, Objective::Utility { .. }) {
-                bests.push((data, rows[0].config.clone()));
+                bests.push((data, robust[0].config.clone(), format!("{} robust best", data.prices.symbol)));
             }
         }
     }
 
-    println!("\n=== 4. Sensitivity (exposure & delta), SPY then QQQ ===");
+    println!("\n=== 5. Sensitivity (current engine) ===");
     for (data, base) in [(&spy, RollConfig::spy()), (&qqq, RollConfig::qqq())] {
-        let mut s = sensitivity(data, &base, SweepParam::Exposure, &[0.5, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0]);
+        let mut s = sensitivity(data, &base, SweepParam::Exposure, &[0.5, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0]);
         s.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         println!("{} exposure sweep:", data.prices.symbol);
         for (v, st) in &s {
             println!("  {v:>4.2}x  CAGR {} MDD {} vol {} Sharpe {:>5.2}", pct(st.cagr), pct(st.max_drawdown), pct(st.ann_vol), st.sharpe);
         }
-        let mut s = sensitivity(data, &base, SweepParam::Delta, &[0.5, 0.6, 0.7, 0.8, 0.9, 0.95]);
+        let mut s = sensitivity(data, &base, SweepParam::Delta, &[0.6, 0.7, 0.8, 0.9]);
         s.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        println!("{} delta sweep @1.5x:", data.prices.symbol);
+        print!("{} delta sweep @1.5x:", data.prices.symbol);
         for (v, st) in &s {
-            println!("  Δ{v:>4.2}  CAGR {} MDD {} vol {} Sharpe {:>5.2}", pct(st.cagr), pct(st.max_drawdown), pct(st.ann_vol), st.sharpe);
+            print!("  Δ{v:.1} {}", pct(st.cagr).trim());
         }
-        let mut s = sensitivity(data, &base, SweepParam::HalfSpreadPct, &[0.0, 0.0025, 0.005, 0.01, 0.02]);
-        s.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        println!("{} half-spread sweep:", data.prices.symbol);
-        for (v, st) in &s {
-            println!("  {:>4.2}%  CAGR {}", v * 100.0, pct(st.cagr));
-        }
+        println!();
     }
 
-    println!("\n=== 5. Walk-forward (train 8y / test 3y, small grid, Utility λ=0.25) ===");
+    println!("\n=== 6. Walk-forward (train 8y / test 3y, small grid, Utility λ=0.25) ===");
     for (data, base) in [(&spy, RollConfig::spy()), (&qqq, RollConfig::qqq())] {
         let w = walk_forward(data, &base, &ParamGrid::small(), Objective::Utility { lambda: 0.25 }, 8.0, 3.0).unwrap();
-        println!("{}:", data.prices.symbol);
-        for x in &w {
-            println!(
-                "  test {}..{}  best {:<26} IS {:>6.3} | OOS CAGR {} MDD {} | base CAGR {} MDD {} | B&H CAGR {}",
-                x.test_start,
-                x.test_end,
-                x.best_config.label(),
-                x.in_sample_score,
-                pct(x.oos_stats.cagr),
-                pct(x.oos_stats.max_drawdown),
-                pct(x.base_oos_stats.cagr),
-                pct(x.base_oos_stats.max_drawdown),
-                pct(x.bh_oos_stats.cagr)
-            );
-        }
         let s = walk_forward_summary(&w);
         println!(
-            "  chained OOS {:.1}y: optimised {} | default {} | B&H {} | opt beats default in {:.0}% of windows",
+            "  {}: chained OOS {:.1}y: optimised {} | default {} | B&H {} | opt beats default in {:.0}% of {} windows",
+            data.prices.symbol,
             s.years,
             pct(s.oos_cagr),
             pct(s.base_cagr),
             pct(s.bh_cagr),
-            s.pct_windows_opt_beats_base * 100.0
+            s.pct_windows_opt_beats_base * 100.0,
+            w.len()
         );
     }
 
-    println!("\n=== 6. Block bootstrap robustness (joint return/vol blocks, mean block 60d) ===");
-    let n = if quick { 100 } else { 400 };
-    let mut cases: Vec<(&BacktestData, RollConfig, &str)> = vec![
-        (&spy, RollConfig::spy(), "SPY default"),
-        (&qqq, RollConfig::qqq(), "QQQ default"),
-        (&qqq, RollConfig { start: NaiveDate::from_ymd_opt(2009, 10, 1), ..RollConfig::qqq() }, "QQQ default, 2009+ only"),
-        (&spy, RollConfig { target_exposure: 1.0, ..RollConfig::spy() }, "SPY 1.0x"),
-        (&qqq, RollConfig { target_exposure: 2.5, ..RollConfig::qqq() }, "QQQ 2.5x"),
-    ];
-    for (d, c) in &bests {
-        cases.push((d, c.clone(), if d.prices.symbol == "SPY" { "SPY optimiser best" } else { "QQQ optimiser best" }));
+    println!("\n=== 7. Block bootstrap (joint return/vol blocks, mean block 60d) ===");
+    let n = if quick { 100 } else { 300 };
+    let mut cases: Vec<(&BacktestData, RollConfig, String)> = Vec::new();
+    for (data, base) in [(&spy, RollConfig::spy()), (&qqq, RollConfig::qqq())] {
+        for e in [1.0, 1.5, 2.0] {
+            cases.push((data, RollConfig { target_exposure: e, ..base.clone() }, format!("{} {e:.1}x", data.prices.symbol)));
+        }
     }
+    cases.extend(bests);
     for (data, cfg, name) in cases {
-        let t0 = Instant::now();
         let r = bootstrap_robustness(data, &cfg, n, 60.0, 7).unwrap();
         println!(
-            "  {name:<24} [{}] n={} {:.0}s\n     CAGR p5/p50/p95 {}/{}/{}  MDD p5/p50 {}/{} | B&H CAGR p50 {} MDD p50 {} | {:.2}x-ETF CAGR p50 {} | P(wipe) {:.1}% P(beat B&H) {:.0}% P(beat LETF) {:.0}% P(loss) {:.1}% P(DD>50%) {:.0}%",
-            cfg.label(),
-            r.n_samples,
-            t0.elapsed().as_secs_f64(),
+            "  {name:<18} CAGR p5/p50/p95 {}/{}/{} MDD p50 {} | minEq p5 {} | P(near-wipe<10%) {:.1}% P(wipe) {:.1}% | B&H p50 {} | matched p50 {} | P(beat B&H) {:.0}% P(beat matched) {:.0}% P(beat LETF) {:.0}%",
             pct(r.cagr.p5).trim(),
             pct(r.cagr.p50).trim(),
             pct(r.cagr.p95).trim(),
-            pct(r.max_dd.p5).trim(),
             pct(r.max_dd.p50).trim(),
-            pct(r.bh_cagr.p50).trim(),
-            pct(r.bh_max_dd.p50).trim(),
-            cfg.target_exposure,
-            pct(r.lev_cagr.p50).trim(),
+            pct(r.min_equity.p5).trim(),
+            r.prob_near_wipe * 100.0,
             r.prob_wipeout * 100.0,
+            pct(r.bh_cagr.p50).trim(),
+            pct(r.matched_cagr.p50).trim(),
             r.prob_beat_benchmark * 100.0,
+            r.prob_beat_matched * 100.0,
             r.prob_beat_lev_etf * 100.0,
-            r.prob_loss * 100.0,
-            r.prob_dd_over_50 * 100.0
         );
     }
 
-    println!("\n=== 7. Advisor (current snapshot) ===");
-    for (data, base) in [(&qqq, RollConfig::qqq()), (&spy, RollConfig::spy())] {
-        let snap = MarketSnapshot::from_history(&data.prices, &data.vol_index);
-        let rows = optimize(data, &base, &ParamGrid::small(), Objective::Utility { lambda: 0.25 }, None);
-        let current = RollConfig { strike: StrikeSelection::Delta(0.8), ..base.clone() };
-        for a in advise(&snap, rows.first(), Some(&current)) {
-            println!("[{}] {}\n    {}", a.level.label(), a.title, a.body);
+    if args.iter().any(|a| a == "--advise") {
+        println!("\n=== 8. Advisor (current snapshot) ===");
+        for (data, base) in [(&qqq, RollConfig::qqq()), (&spy, RollConfig::spy())] {
+            let snap = MarketSnapshot::from_history(&data.prices, &data.vol_index);
+            let rows = optimize(data, &base, &ParamGrid::small(), Objective::Utility { lambda: 0.25 }, None);
+            let current = RollConfig { strike: StrikeSelection::Delta(0.8), ..base.clone() };
+            for a in advise(&snap, rows.first(), Some(&current)) {
+                println!("[{}] {}\n    {}", a.level.label(), a.title, a.body);
+            }
         }
     }
-    if std::env::args().any(|a| a == "--kb") {
+    if args.iter().any(|a| a == "--kb") {
         for a in strategy_conclusions() {
             println!("[{}] {}\n    {}", a.level.label(), a.title, a.body);
         }
