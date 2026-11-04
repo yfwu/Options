@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test core / data / cli
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit & integration tests
+        run: cargo test --locked -p optlab-core -p optlab-data -p optlab-cli
+      - name: LEAPS study smoke run (bundled data)
+        run: cargo run --locked --release -p optlab-cli -- backtest --symbol QQQ
+
+  app:
+    name: Build desktop app (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux system libraries for GPUI
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libvulkan-dev libfontconfig-dev libfreetype-dev \
+            libssl-dev pkg-config libzstd-dev
+      - name: Build optlab-app
+        run: cargo build --locked --release -p optlab-app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: optlab-${{ matrix.os }}
+          path: |
+            target/release/optlab-app
+            target/release/optlab-app.exe
+            target/release/optlab
+            target/release/optlab.exe
+          if-no-files-found: ignore
