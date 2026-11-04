@@ -20,6 +20,7 @@ pub mod bundled;
 pub mod config;
 pub mod csv_import;
 pub mod history;
+pub mod presets;
 pub mod http;
 pub mod providers;
 pub mod store;
