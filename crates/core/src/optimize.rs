@@ -6,7 +6,14 @@
 //! * [`bootstrap_robustness`] — stationary block bootstrap of **joint** (daily log
 //!   return, daily vol-index log change) pairs ⇒ synthetic histories that keep the
 //!   leverage effect (vol spikes when prices fall), then re-run the backtest.
+//! * [`optimize_robust`] — grid search scored on a quantile of the objective over
+//!   common bootstrap paths (+ the real history), optionally smoothed over grid
+//!   neighbours, so the winner is not single-path noise.
 //! * [`sensitivity`] / [`heatmap`] — 1-D sweeps and delta × DTE grids for charts.
+//!
+//! Rows whose realised average exposure is below [`MIN_EXPOSURE_RATIO`] of the target
+//! (e.g. because `max_premium_pct` binds) are flagged (`exposure_ok = false`) and
+//! ranked after all rows that achieve their target.
 
 use anyhow::{bail, Result};
 use chrono::{Duration, NaiveDate};
@@ -15,7 +22,10 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::backtest::{buy_hold_curve, leveraged_curve, simulate, Aligned, BacktestData, RollConfig, StrikeSelection};
+use crate::backtest::{
+    buy_hold_curve, exposure_matched_curve, exposure_shortfall, leveraged_curve, result_label, simulate, Aligned, BacktestData, RollConfig,
+    StrikeSelection,
+};
 use crate::stats::{compute_stats, quantile, PerformanceStats};
 
 /// Search grid. Empty vectors mean "keep the base config's value".
@@ -63,6 +73,12 @@ impl ParamGrid {
 
     /// Expand into concrete configs (base fields kept for everything not in the grid).
     pub fn configs(&self, base: &RollConfig) -> Vec<RollConfig> {
+        self.configs_indexed(base).into_iter().map(|(_, c)| c).collect()
+    }
+
+    /// Like [`configs`](Self::configs) with each combo's index in every grid dimension
+    /// (strike, entry, roll, exposure, roll-up, band).
+    fn configs_indexed(&self, base: &RollConfig) -> Vec<([usize; 6], RollConfig)> {
         let strikes: Vec<StrikeSelection> = if self.deltas.is_empty() {
             vec![base.strike]
         } else {
@@ -75,22 +91,22 @@ impl ParamGrid {
         let ups = if self.roll_up_deltas.is_empty() { vec![base.roll_up_delta] } else { self.roll_up_deltas.clone() };
         let bands = if self.rebalance_bands.is_empty() { vec![base.rebalance_band] } else { self.rebalance_bands.clone() };
         let mut out = Vec::new();
-        for &strike in &strikes {
-            for &e in &entries {
-                for &r in &rolls {
+        for (si, &strike) in strikes.iter().enumerate() {
+            for (ei, &e) in entries.iter().enumerate() {
+                for (ri, &r) in rolls.iter().enumerate() {
                     if e <= r || e - r < self.min_hold_days {
                         continue;
                     }
-                    for &x in &exps {
-                        for &u in &ups {
+                    for (xi, &x) in exps.iter().enumerate() {
+                        for (ui, &u) in ups.iter().enumerate() {
                             // a roll-up threshold below the entry delta would roll every day
                             if let (Some(u), StrikeSelection::Delta(d)) = (u, strike) {
                                 if u <= d + 0.02 {
                                     continue;
                                 }
                             }
-                            for &b in &bands {
-                                out.push(RollConfig {
+                            for (bi, &b) in bands.iter().enumerate() {
+                                out.push(([si, ei, ri, xi, ui, bi], RollConfig {
                                     strike,
                                     entry_dte: e,
                                     roll_dte: r,
@@ -98,7 +114,7 @@ impl ParamGrid {
                                     roll_up_delta: u,
                                     rebalance_band: b,
                                     ..base.clone()
-                                });
+                                }));
                             }
                         }
                     }
@@ -179,19 +195,54 @@ impl Objective {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OptRow {
     pub config: RollConfig,
+    /// Statistics on the actual history.
     pub stats: PerformanceStats,
+    /// Ranking score (for [`optimize_robust`]: the robust score).
     pub score: f64,
     pub n_rolls: usize,
     pub total_costs: f64,
     pub avg_exposure: f64,
     pub avg_extrinsic_pct_annual: f64,
     pub wiped_out: bool,
+    /// Lowest equity / initial capital on the actual history.
+    #[serde(default)]
+    pub min_equity_ratio: f64,
+    /// `min_equity_ratio < config.near_wipe_level`.
+    #[serde(default)]
+    pub near_wipe: bool,
+    /// 1 − avg_exposure / target_exposure (positive ⇒ under-exposed).
+    #[serde(default)]
+    pub exposure_shortfall: f64,
+    /// avg_exposure ≥ [`MIN_EXPOSURE_RATIO`] × target.
+    #[serde(default = "default_true")]
+    pub exposure_ok: bool,
+    /// Objective score on the actual history alone.
+    #[serde(default)]
+    pub history_score: f64,
+    /// Interquartile range of the per-path scores ([`optimize_robust`]; 0 otherwise).
+    #[serde(default)]
+    pub score_iqr: f64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Minimum realised/target exposure ratio for a row to count as achieving its target.
+pub const MIN_EXPOSURE_RATIO: f64 = 0.85;
+
+impl OptRow {
+    /// Config label with realised exposure (when it deviates > 5%) and survival markers.
+    pub fn label(&self) -> String {
+        result_label(&self.config, self.avg_exposure, self.min_equity_ratio, self.near_wipe, self.wiped_out)
+    }
 }
 
 fn eval_one(al: &Aligned, cfg: &RollConfig, obj: Objective) -> Option<OptRow> {
     let sim = simulate(al, cfg, false).ok()?;
     let stats = compute_stats(&sim.curve, sim.avg_rate);
     let score = obj.score(&stats, sim.wiped_out);
+    let shortfall = exposure_shortfall(sim.avg_exposure, cfg.target_exposure);
     Some(OptRow {
         config: cfg.clone(),
         stats,
@@ -201,11 +252,22 @@ fn eval_one(al: &Aligned, cfg: &RollConfig, obj: Objective) -> Option<OptRow> {
         avg_exposure: sim.avg_exposure,
         avg_extrinsic_pct_annual: sim.avg_extrinsic_pct_annual,
         wiped_out: sim.wiped_out,
+        min_equity_ratio: sim.min_equity_ratio,
+        near_wipe: sim.near_wipe,
+        exposure_shortfall: shortfall,
+        exposure_ok: cfg.target_exposure <= 0.0 || 1.0 - shortfall >= MIN_EXPOSURE_RATIO,
+        history_score: score,
+        score_iqr: 0.0,
     })
 }
 
+/// Rows achieving their exposure target first, then by score (best first).
 fn sort_rows(rows: &mut [OptRow]) {
-    rows.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_by(|a, b| {
+        b.exposure_ok
+            .cmp(&a.exposure_ok)
+            .then(b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
+    });
 }
 
 pub(crate) fn optimize_aligned(
@@ -245,6 +307,119 @@ pub fn optimize(
         Ok(al) => optimize_aligned(&al, base, grid, objective, progress),
         Err(_) => Vec::new(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Robust optimisation
+// ---------------------------------------------------------------------------
+
+/// Options for [`optimize_robust`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RobustOptions {
+    /// Bootstrap paths (common random numbers: every combo sees the same paths).
+    pub n_paths: usize,
+    /// Mean block length of the stationary bootstrap (trading days).
+    pub block_days: f64,
+    pub seed: u64,
+    /// Also score the actual history as one more path.
+    pub include_history: bool,
+    /// Quantile of the per-path scores used as the score (0.5 = median, 0.25 = cautious).
+    pub quantile: f64,
+    /// Blend each combo's score with its grid neighbours (one step in one dimension).
+    pub smooth_neighbours: bool,
+    /// Weight of the combo itself when smoothing (the rest is split over neighbours).
+    pub self_weight: f64,
+}
+
+impl Default for RobustOptions {
+    /// 12 paths + history, median, neighbour smoothing 50/50. The default 600-combo
+    /// grid on 27 years of daily data takes a few seconds on a 4-core machine.
+    fn default() -> Self {
+        Self { n_paths: 12, block_days: 60.0, seed: 7, include_history: true, quantile: 0.5, smooth_neighbours: true, self_weight: 0.5 }
+    }
+}
+
+/// Grid search scored on the `quantile` of `objective` across bootstrap paths (joint
+/// return/vol-index blocks, same as [`bootstrap_robustness`]) plus the actual history,
+/// optionally smoothed over grid neighbours. `stats` / `history_score` in each row still
+/// refer to the actual history; `score` is the robust score; `score_iqr` its dispersion.
+pub fn optimize_robust(
+    data: &BacktestData,
+    base: &RollConfig,
+    grid: &ParamGrid,
+    objective: Objective,
+    opts: &RobustOptions,
+    progress: Option<&(dyn Fn(usize, usize) + Sync)>,
+) -> Result<Vec<OptRow>> {
+    let al = Aligned::new(data)?;
+    let Some((i0, i1)) = al.range(base.start, base.end) else {
+        bail!("no data in range");
+    };
+    if i1 - i0 < 30 {
+        bail!("need at least 30 days of history");
+    }
+    let paths: Vec<Aligned> = (0..opts.n_paths)
+        .map(|k| {
+            let mut rng = StdRng::seed_from_u64(opts.seed ^ (k as u64).wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            synthetic_history(&al, i0, i1, opts.block_days, &mut rng)
+        })
+        .collect();
+    let indexed = grid.configs_indexed(base);
+    let total = indexed.len();
+    let done = AtomicUsize::new(0);
+    let q = opts.quantile.clamp(0.0, 1.0);
+    let mut rows: Vec<([usize; 6], OptRow)> = indexed
+        .par_iter()
+        .filter_map(|(idx, c)| {
+            let mut row = eval_one(&al, c, objective)?;
+            let free = RollConfig { start: None, end: None, ..c.clone() };
+            let mut scores: Vec<f64> = paths
+                .iter()
+                .filter_map(|p| {
+                    let sim = simulate(p, &free, false).ok()?;
+                    Some(objective.score(&compute_stats(&sim.curve, sim.avg_rate), sim.wiped_out))
+                })
+                .collect();
+            if opts.include_history || scores.is_empty() {
+                scores.push(row.history_score);
+            }
+            row.score = quantile(&scores, q);
+            row.score_iqr = quantile(&scores, 0.75) - quantile(&scores, 0.25);
+            let k = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(p) = progress {
+                p(k, total);
+            }
+            Some((*idx, row))
+        })
+        .collect();
+    if opts.smooth_neighbours && rows.len() > 1 {
+        let map: std::collections::HashMap<[usize; 6], f64> = rows.iter().map(|(i, r)| (*i, r.score)).collect();
+        let w = opts.self_weight.clamp(0.0, 1.0);
+        for (idx, row) in rows.iter_mut() {
+            let mut nb = Vec::new();
+            for dim in 0..6 {
+                for step in [-1i64, 1] {
+                    let v = idx[dim] as i64 + step;
+                    if v < 0 {
+                        continue;
+                    }
+                    let mut j = *idx;
+                    j[dim] = v as usize;
+                    if let Some(sc) = map.get(&j) {
+                        nb.push(*sc);
+                    }
+                }
+            }
+            if !nb.is_empty() {
+                let mean = nb.iter().sum::<f64>() / nb.len() as f64;
+                row.score = w * row.score + (1.0 - w) * mean;
+            }
+        }
+    }
+    let mut out: Vec<OptRow> = rows.into_iter().map(|(_, r)| r).collect();
+    sort_rows(&mut out);
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +607,18 @@ pub struct RobustnessReport {
     pub prob_dd_over_50: f64,
     pub cagr_samples: Vec<f64>,
     pub max_dd_samples: Vec<f64>,
+    /// P(min equity < `config.near_wipe_level`, default 10% of initial capital).
+    #[serde(default)]
+    pub prob_near_wipe: f64,
+    /// Lowest equity / initial capital per path.
+    #[serde(default)]
+    pub min_equity: Percentiles,
+    /// Exposure-matched linear benchmark on the same paths.
+    #[serde(default)]
+    pub matched_cagr: Percentiles,
+    /// P(strategy CAGR > exposure-matched linear CAGR): the option-specific edge.
+    #[serde(default)]
+    pub prob_beat_matched: f64,
 }
 
 /// Anchor strength pulling the synthetic vol path back to the source block's level
@@ -474,6 +661,9 @@ pub(crate) fn synthetic_history(al: &Aligned, i0: usize, i1: usize, block_days: 
 }
 
 struct BootSample {
+    min_eq: f64,
+    near_wipe: bool,
+    matched_cagr: f64,
     cagr: f64,
     mdd: f64,
     sharpe: f64,
@@ -510,7 +700,11 @@ pub fn bootstrap_robustness(data: &BacktestData, config: &RollConfig, n_samples:
                 &leveraged_curve(&syn, 0, m, 1.0, cfg.target_exposure, cfg.lev_borrow_spread, cfg.lev_expense_ratio),
                 sim.avg_rate,
             );
+            let matched = compute_stats(&exposure_matched_curve(&syn, 0, m, 1.0, &sim.exposures, cfg.option_rate_spread), sim.avg_rate);
             Some(BootSample {
+                min_eq: sim.min_equity_ratio,
+                near_wipe: sim.near_wipe,
+                matched_cagr: matched.cagr,
                 cagr: st.cagr,
                 mdd: st.max_drawdown,
                 sharpe: st.sharpe,
@@ -547,6 +741,10 @@ pub fn bootstrap_robustness(data: &BacktestData, config: &RollConfig, n_samples:
         prob_beat_lev_etf: res.iter().filter(|r| r.cagr > r.lev_cagr).count() as f64 / n,
         prob_loss: res.iter().filter(|r| r.loss).count() as f64 / n,
         prob_dd_over_50: res.iter().filter(|r| r.mdd < -0.5).count() as f64 / n,
+        prob_near_wipe: res.iter().filter(|r| r.near_wipe).count() as f64 / n,
+        min_equity: Percentiles::from_samples(&col(&|r| r.min_eq)),
+        matched_cagr: Percentiles::from_samples(&col(&|r| r.matched_cagr)),
+        prob_beat_matched: res.iter().filter(|r| r.cagr > r.matched_cagr).count() as f64 / n,
         cagr_samples: cagr,
         max_dd_samples: mdd,
     })
@@ -673,6 +871,25 @@ mod tests {
         let s = PerformanceStats { cagr: 0.2, max_drawdown: -0.5, ..Default::default() };
         assert!(Objective::MaxCagrWithDdCap { max_dd: 0.4 }.score(&s, false) < -0.5);
         assert!((Objective::Utility { lambda: 0.2 }.score(&s, false) - 0.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn robust_optimizer_and_flags() {
+        let data = gbm_data(8.0, 0.09, 0.2, 20.0, 0.02, 0.01, 21);
+        let grid = ParamGrid { exposures: vec![1.0, 1.5], ..ParamGrid::small() };
+        let opts = RobustOptions { n_paths: 4, ..RobustOptions::default() };
+        let a = optimize_robust(&data, &RollConfig::default(), &grid, Objective::Calmar, &opts, None).unwrap();
+        let b = optimize_robust(&data, &RollConfig::default(), &grid, Objective::Calmar, &opts, None).unwrap();
+        assert_eq!(a.len(), grid.len(&RollConfig::default()));
+        assert_eq!(a.iter().map(|r| r.score).collect::<Vec<_>>(), b.iter().map(|r| r.score).collect::<Vec<_>>());
+        assert!(a.windows(2).all(|w| (w[0].exposure_ok, w[0].score) >= (w[1].exposure_ok, w[1].score)));
+        assert!(a.iter().all(|r| r.score_iqr >= 0.0 && r.min_equity_ratio > 0.0));
+        // a combo that cannot reach its target exposure is flagged
+        let cfg = RollConfig { strike: StrikeSelection::Delta(0.95), target_exposure: 4.0, max_premium_pct: 0.5, ..RollConfig::default() };
+        let rows = optimize(&data, &cfg, &ParamGrid { deltas: vec![], entry_dtes: vec![], roll_dtes: vec![], exposures: vec![], roll_up_deltas: vec![], ..ParamGrid::small() }, Objective::Cagr, None);
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].exposure_ok && rows[0].exposure_shortfall > 0.15, "{}", rows[0].exposure_shortfall);
+        assert!(rows[0].label().contains("實際"));
     }
 
     #[test]

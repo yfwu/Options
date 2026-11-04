@@ -290,7 +290,13 @@ pub fn demo_chain(symbol: &str) -> Result<OptionChain, String> {
                 }
                 let half = (g.price * 0.012).max(0.02).min(g.price * 0.2 + 0.05);
                 let mny = ((k / spot).ln() / (atm * t.sqrt()).max(1e-6)).abs();
-                let oi = (20000.0 * (-0.5 * mny * mny).exp() / (1.0 + 2.0 * t) + 50.0).round();
+                // skewed open interest: calls cluster above spot, puts (larger) below
+                let tilt = ((k / spot - 1.0) * 12.0).tanh();
+                let side = match kind {
+                    OptionKind::Call => 1.0 + 0.6 * tilt,
+                    OptionKind::Put => 1.25 * (1.0 - 0.6 * tilt),
+                };
+                let oi = (20000.0 * side * (-0.5 * mny * mny).exp() / (1.0 + 2.0 * t) + 50.0).round();
                 let vol = (oi * 0.08 / (1.0 + 4.0 * t)).round();
                 let contract = format!(
                     "{}{}{}{:08}",

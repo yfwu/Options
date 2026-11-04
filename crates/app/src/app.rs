@@ -46,9 +46,7 @@ pub struct OptLabApp {
 
 impl OptLabApp {
     pub fn new(page: Page, autorun: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let t0 = std::time::Instant::now();
         let state = cx.new(|_| AppState::new());
-        eprintln!("optlab: state {:?}", t0.elapsed());
         let dashboard = cx.new(|cx| DashboardPage::new(state.clone(), window, cx));
         let chain = cx.new(|cx| ChainPage::new(state.clone(), window, cx));
         let strategy = cx.new(|cx| StrategyPage::new(state.clone(), window, cx));
@@ -77,7 +75,6 @@ impl OptLabApp {
             cx.observe(&state, |_, _, cx| cx.notify()),
         ];
 
-        eprintln!("optlab: pages {:?}", t0.elapsed());
         let focus = cx.focus_handle();
         window.focus(&focus);
 
@@ -302,7 +299,6 @@ impl Focusable for OptLabApp {
 
 impl Render for OptLabApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if std::env::var("OPTLAB_MIN").is_ok() { return div().size_full().bg(gpui::red()).child("MIN").into_any_element(); }
         let dialog_layer = Root::render_dialog_layer(window, cx);
         let notification_layer = Root::render_notification_layer(window, cx);
         let sidebar = self.render_sidebar(cx).into_any_element();

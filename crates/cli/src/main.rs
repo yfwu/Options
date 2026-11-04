@@ -9,7 +9,7 @@ use chrono::NaiveDate;
 use clap::{Parser, Subcommand, ValueEnum};
 use optlab_core::advisor::{advise, strategy_conclusions, MarketSnapshot};
 use optlab_core::backtest::{run_backtest, BacktestData, BacktestResult, RollConfig, StrikeSelection};
-use optlab_core::optimize::{bootstrap_robustness, optimize, walk_forward, walk_forward_summary, Objective, ParamGrid};
+use optlab_core::optimize::{bootstrap_robustness, optimize, optimize_robust, walk_forward, walk_forward_summary, Objective, ParamGrid, RobustOptions};
 use optlab_core::stats::PerformanceStats;
 use optlab_core::strategy::{build_from_chain, build_synthetic, MarketParams, StrategyTemplate, ALL_TEMPLATES};
 use optlab_core::surface::ChainAnalytics;
@@ -127,6 +127,10 @@ enum Cmd {
         /// Use the small (36 combo) grid.
         #[arg(long)]
         small: bool,
+        /// Score each combo by the median over bootstrap paths + neighbour smoothing
+        /// (recommended: resists fitting a single historical path).
+        #[arg(long)]
+        robust: bool,
     },
     /// Block-bootstrap robustness of one configuration.
     Robust {
@@ -229,8 +233,8 @@ fn stats_row(name: &str, s: &PerformanceStats) {
 
 fn print_result(r: &BacktestResult) {
     println!(
-        "{}  {} → {} ({:.1} 年)  轉倉 {} 次  交易成本 ${:.0}（{:.2}%/年）  平均曝險 {:.2}x  持有成本 {:.2}%/年（名目）{}",
-        r.config.label(),
+        "{}  {} → {} ({:.1} 年)  轉倉 {} 次  交易成本 ${:.0}（{:.2}%/年）  平均曝險 {:.2}x  持有成本 {:.2}%/年（名目）  最低權益 {}{}",
+        r.label(),
         r.stats.start,
         r.stats.end,
         r.stats.years,
@@ -239,7 +243,14 @@ fn print_result(r: &BacktestResult) {
         r.cost_drag_annual * 100.0,
         r.avg_exposure,
         r.avg_carry_pct_of_exposure * 100.0,
-        if r.wiped_out { format!("  ⚠ 爆倉 {}", r.wiped_date.map(|d| d.to_string()).unwrap_or_default()) } else { String::new() }
+        pct(r.min_equity_ratio),
+        if r.wiped_out {
+            format!("  ⚠ 爆倉 {}", r.wiped_date.map(|d| d.to_string()).unwrap_or_default())
+        } else if r.near_wipe {
+            "  ⚠ 近乎歸零".to_string()
+        } else {
+            String::new()
+        }
     );
     stats_row("LEAPS 滾動", &r.stats);
     for (n, s) in &r.benchmark_stats {
@@ -294,36 +305,44 @@ fn main() -> Result<()> {
                 println!("已寫出 {}", p.display());
             }
         }
-        Cmd::Optimize { roll, objective: o, param, top, small } => {
+        Cmd::Optimize { roll, objective: o, param, top, small, robust } => {
             let data = roll.data()?;
             let grid = if small { ParamGrid::small() } else { ParamGrid::default() };
             let base = roll.config();
             let n = grid.len(&base);
             eprintln!("搜尋 {n} 組參數…");
             let t0 = std::time::Instant::now();
-            let rows = optimize(&data, &base, &grid, objective(o, param), None);
+            let rows = if robust {
+                optimize_robust(&data, &base, &grid, objective(o, param), &RobustOptions::default(), None)?
+            } else {
+                optimize(&data, &base, &grid, objective(o, param), None)
+            };
             eprintln!("完成，用時 {:.2}s", t0.elapsed().as_secs_f64());
-            println!("{:<4} {:<34} {:>8} {:>8} {:>8} {:>7} {:>7} {:>6}", "#", "參數", "分數", "CAGR", "最大回撤", "Sharpe", "Calmar", "爆倉");
+            println!("{:<4} {:<46} {:>8} {:>8} {:>8} {:>7} {:>7} {:>8}", "#", "參數", "分數", "CAGR", "最大回撤", "Sharpe", "Calmar", "最低權益");
             for (i, r) in rows.iter().take(top).enumerate() {
                 println!(
-                    "{:<4} {:<34} {:>8.3} {:>8} {:>8} {:>7.2} {:>7.2} {:>6}",
+                    "{:<4} {:<46} {:>8.3} {:>8} {:>8} {:>7.2} {:>7.2} {:>8}",
                     i + 1,
-                    r.config.label(),
+                    r.label(),
                     r.score,
                     pct(r.stats.cagr),
                     pct(r.stats.max_drawdown),
                     r.stats.sharpe,
                     r.stats.calmar,
-                    if r.wiped_out { "是" } else { "" }
+                    pct(r.min_equity_ratio)
                 );
             }
-            println!("\n提醒：網格搜尋會過度擬合歷史，請用 walk-forward 與 robust 指令檢驗。");
+            if robust {
+                println!("\n分數 = 12 條拔靴路徑 + 真實歷史的中位數，並與相鄰格點平滑。");
+            } else {
+                println!("\n提醒：單一歷史路徑的網格搜尋會過度擬合，建議加上 --robust，並用 walk-forward / robust 指令檢驗。");
+            }
         }
         Cmd::Robust { roll, samples, block_days, seed } => {
             let data = roll.data()?;
             let cfg = roll.config();
             let r = bootstrap_robustness(&data, &cfg, samples, block_days, seed)?;
-            println!("{}  區塊自助法 {} 條合成歷史（區塊 {} 天，每條 {:.1} 年）", cfg.label(), r.n_samples, r.block_days, r.years);
+            println!("{}  區塊拔靴法 {} 條合成歷史（區塊 {} 天，每條 {:.1} 年）", cfg.label(), r.n_samples, r.block_days, r.years);
             let row = |n: &str, p: &optlab_core::optimize::Percentiles| {
                 println!("  {:<18} p5 {:>7}  p25 {:>7}  中位 {:>7}  p75 {:>7}  p95 {:>7}", n, pct(p.p5), pct(p.p25), pct(p.p50), pct(p.p75), pct(p.p95))
             };
@@ -333,13 +352,17 @@ fn main() -> Result<()> {
             row("買進持有 最大回撤", &r.bh_max_dd);
             row("槓桿ETF CAGR", &r.lev_cagr);
             row("槓桿ETF 最大回撤", &r.lev_max_dd);
+            row("曝險配對 CAGR", &r.matched_cagr);
+            row("最低權益/初始", &r.min_equity);
             println!(
-                "  爆倉機率 {}  虧損機率 {}  回撤>50% 機率 {}  勝過買進持有 {}  勝過同倍槓桿ETF {}",
+                "  爆倉機率 {}  近乎歸零(<10%) {}  虧損機率 {}  回撤>50% 機率 {}  勝過買進持有 {}  勝過同倍槓桿ETF {}  勝過曝險配對 {}",
                 pct(r.prob_wipeout),
+                pct(r.prob_near_wipe),
                 pct(r.prob_loss),
                 pct(r.prob_dd_over_50),
                 pct(r.prob_beat_benchmark),
-                pct(r.prob_beat_lev_etf)
+                pct(r.prob_beat_lev_etf),
+                pct(r.prob_beat_matched)
             );
         }
         Cmd::WalkForward { roll, train, test, objective: o } => {
@@ -413,11 +436,11 @@ fn main() -> Result<()> {
                         print!(" {:>8}/{:>8}", pct(b.total_return), pct(b.max_drawdown));
                         bh_done = true;
                     }
-                    print!(" {:>8}/{:>8}{}", pct(r.stats.total_return), pct(r.stats.max_drawdown), if r.wiped_out { "⚠" } else { "" });
+                    print!(" {:>8}/{:>8}{}", pct(r.stats.total_return), pct(r.stats.max_drawdown), if r.wiped_out || r.near_wipe { "⚠" } else { " " });
                 }
                 println!();
             }
-            println!("（每個區間從起點以全新部位建倉；報酬含區間內的反彈）");
+            println!("（每個區間從起點以全新部位建倉；報酬含區間內的反彈；⚠ = 權益曾低於初始 10%）");
         }
         Cmd::Advise { symbol, kb } => {
             let prices = bundled::prices(&symbol).with_context(|| format!("no bundled data for {symbol}"))?;

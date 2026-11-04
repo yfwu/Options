@@ -11,9 +11,14 @@ fn main() {
         gpui_component::init(cx);
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), |window, cx| {
+                let ms: u64 = std::env::var("SLEEP").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                std::thread::sleep(std::time::Duration::from_millis(ms));
                 let view = cx.new(|_| Hello);
                 cx.new(|cx| Root::new(view, window, cx))
             })?;
+            let ms2: u64 = std::env::var("SLEEP2").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+            cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+            std::thread::sleep(std::time::Duration::from_millis(ms2));
             Ok::<_, anyhow::Error>(())
         }).detach();
     });
