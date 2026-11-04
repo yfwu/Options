@@ -1,14 +1,14 @@
 # 定價核對 (pricing.rs vs scipy)
 格點數: 11524
-price  max|abs err| = 2.79e-09   max rel err (|ref|>1e-6) = 2.18e-09
-delta  max|abs err| = 2.24e-11   max rel err (|ref|>1e-6) = 9.39e-11
+price  max|abs err| = 5.68e-14   max rel err (|ref|>1e-6) = 5.72e-10
+delta  max|abs err| = 2.22e-16   max rel err (|ref|>1e-6) = 1.88e-11
 gamma  max|abs err| = 5.55e-17   max rel err (|ref|>1e-6) = 7.68e-16
-theta  max|abs err| = 5.57e-13   max rel err (|ref|>1e-6) = 4.68e-09
+theta  max|abs err| = 1.67e-16   max rel err (|ref|>1e-6) = 2.99e-13
 vega   max|abs err| = 2.22e-16   max rel err (|ref|>1e-6) = 9.12e-16
-rho    max|abs err| = 6.55e-11   max rel err (|ref|>1e-6) = 9.38e-11
+rho    max|abs err| = 1.33e-15   max rel err (|ref|>1e-6) = 2.71e-11
 IV 反解 (vega>1e-4 per pt): max |iv - sigma| = 6.29e-09, NaN 數 = 0
   |iv-sigma|>1e-6 的格點: 0
-strike_for_delta(0.80) 反算 delta 誤差 max = 2.15e-13
+strike_for_delta(0.80) 反算 delta 誤差 max = 7.99e-15
 
 Hull 教科書數值:
 kind  s  k        t    r  sigma    price     delta    gamma     theta     vega       rho

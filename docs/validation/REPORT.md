@@ -1,6 +1,6 @@
 # OptLab 引擎獨立驗證報告：滾動 LEAPS 買權（QQQ / SPY）
 
-> 驗證對象：`crates/core/src/{pricing,synth,stats,backtest,optimize}.rs`，commit `83d5b6a`（`claude/optimistic-carson-74sleg`，驗證期間再次 fetch 仍為同一 commit）。
+> 驗證對象：`crates/core/src/{pricing,synth,stats,backtest,optimize}.rs`。主要分析在 commit `83d5b6a`（`claude/optimistic-carson-74sleg`）上完成；收尾時來源分支新增 `7140c6d`，已合併並重跑定價核對與回測複現（見 §2.4）。
 > 驗證者未修改任何 `crates/*` 原始碼。所有程式、資料輸出與圖表位於 `validation/` 與 `docs/validation/`，`validation/run_all.sh` 可一鍵重現。
 > 撰寫日期：2026-11-04。
 
@@ -9,7 +9,7 @@
 ## 0. 摘要
 
 **驗證為正確的部分：**
-- `pricing.rs` 的 BS 價格、Greeks、IV 反解：在 11,520 個格點上與 scipy 對照，最大誤差約 3e-9。Hull 教科書數值全部吻合。
+- `pricing.rs` 的 BS 價格、Greeks、IV 反解：在 11,520 個格點上與 scipy 對照，最大誤差約 3e-9（`7140c6d` 改用 West 演算法後降到 6e-14）。Hull 教科書數值全部吻合。
 - `synth.rs` 的曲面公式與文件一致，誤差 5e-13。
 - `run_backtest` 的實作符合文件規則。以獨立 Python 依相同規則重寫，QQQ 1999–2026 與 SPY 1993–2026 共 10 組設定，CAGR 差距最大 0.16%/年，遠低於 0.5%/年門檻。
 - 沒有發現使用未來資料（look-ahead）的錯誤。股息由買權持有人放棄這點，模型已正確處理。
@@ -65,7 +65,7 @@
 
 | 量 | 最大絕對誤差 | 最大相對誤差 |
 |---|---|---|
-| 價格 | 2.8e-9 | 2.2e-9 |
+| 價格 | 2.8e-9（`7140c6d`：5.7e-14） | 2.2e-9 |
 | Delta | 2.2e-11 | 9.4e-11 |
 | Gamma / Vega | 6e-17 / 2e-16 | <1e-15 |
 | Theta（每日） | 5.6e-13 | 4.7e-9 |
@@ -108,6 +108,15 @@ Hull 範例對照：
 - 價格路徑由 `spot = adj·e^{q(T_last−t)}` 重建，並以 q 定價。買權不領股息這點**有被正確處理**：q=0.4% 對 0.7% 只差 −0.26%/年，且符號合理。
 - 到期以內含價值結算；成交價套用半價差與手續費；vol 指數向前填補（只用 ≤ 當日的值）。
 - **沒有未來資料。**
+
+### 2.4 來源分支更新 `7140c6d` 之後
+
+- `pricing.rs::norm_cdf` 改用 West/Hart 演算法：重跑後價格最大誤差 5.7e-14、delta 2.2e-16，IV 反解不變。`cargo test --locked -p optlab-core` 共 67 項全過。
+- `backtest.rs` 與 `synth.rs` 未變；10 組複現回測的 Rust CAGR 與先前相同（到 1e-12）。本報告的回測數字全部適用於 `7140c6d`。
+- 新增的 `optlab-data` presets（CLI/GUI 路徑）**已部分處理 B3/B5**：
+  - QQQ 改用真實 VXN（2000-10 起），之前用 VIX×2.13。檢查 1999-04 至 2000-09：此代理值季平均 41–53，其後 1 年實現波動 45–60，比舊代理值合理得多。
+  - 利率改用 FRED DGS3MO。
+- 但 `examples/leaps_study.rs` 與 `docs/research/*` 仍用舊代理值與憑記憶的利率，所以開發者的初步結果（包含 +1.6%/年）仍受 B3/B5 影響。本報告的「保守假設」與新 presets 在 2000-10 之後大致相同。
 
 ---
 
@@ -529,7 +538,7 @@ B9：以拔靴或 walk-forward 的中位數作為目標函數，或對網格結�
 - 價差只有一條 DOV 個股長天期鏈可用，SPY/QQQ 的實際 LEAPS 價差未驗證。
 - QQQ 2000-10 以前仍需用代理 vol。2000-03 至 2000-10 的網路泡沫前段，即使在「保守假設」下也偏便宜。
 - 拔靴的利率固定為 3%，並假設報酬與 vol 的區塊抽樣足以重現危機的動態。
-- 本報告驗證的是 commit `83d5b6a`。`optimize.rs` 仍在開發中，本報告只使用了它的 bootstrap 方法作為設計參考，沒有驗證其最佳化與 walk-forward 結果。
+- 本報告主要驗證 commit `83d5b6a`，並已在 `7140c6d` 上重跑核心核對。`optimize.rs` 仍在開發中，本報告只使用了它的 bootstrap 方法作為設計參考，沒有驗證其最佳化與 walk-forward 結果。
 
 ---
 
