@@ -15,7 +15,7 @@ use gpui_component::{
     select::{Select, SelectEvent, SelectState},
     v_flex, ActiveTheme, IndexPath, Sizable,
 };
-use optlab_core::payoff::{compile, examples, parse, price, value_curve, CompileOptions, Instrument, LegStyle, Market, PayoffStats, PricedPayoff, Replication, SyntheticMarket};
+use optlab_core::payoff::{compile_book, examples, parse, price, value_curve, CompileOptions, Instrument, LegStyle, Market, PayoffStats, PricedPayoff, Replication, SyntheticMarket};
 use optlab_core::strategy::{Leg, Strategy};
 use optlab_core::{OptionChain, OptionKind};
 use optlab_data::{bundled, presets};
@@ -50,6 +50,8 @@ const REFERENCE: &[(&str, &str)] = &[
     ("max min abs pos neg", "max/min 可多參數；pos(x)=x⁺"),
     ("clamp(x,lo,hi) sqrt ln exp", "非線性函數 → 以履約價網格近似"),
     ("a = 600; call(a)", "變數；以 ; 或換行分隔，# 註解"),
+    ("expr @ 45 · @ 6m · @ 1y", "跨到期日：替子函數指定到期（天/週 w/月 m/年 y）；未標記者用 DTE 欄位"),
+    ("call(80%) @ 540 − call(105%) @ 45", "不同到期日只能線性組合（+ − ×常數），不可放進 max/min 等非線性函數"),
 ];
 
 /// Everything the background job needs (Send).
@@ -62,6 +64,7 @@ struct Job {
     q: f64,
     skew: f64,
     iv: Option<f64>,
+    long_iv: Option<f64>,
     units: f64,
     mu: f64,
     style: LegStyle,
@@ -77,7 +80,6 @@ struct Out {
     market_label: String,
     from_chain: bool,
     created: NaiveDate,
-    expiry: NaiveDate,
     lo: f64,
     hi: f64,
     target: Vec<(f64, f64)>,
@@ -85,6 +87,8 @@ struct Out {
     now: Vec<(f64, f64)>,
     mid: Vec<(f64, f64)>,
     legs: Vec<(String, Vec<(f64, f64)>)>,
+    /// Per priced leg: expiry label and date.
+    leg_exp: Vec<(String, NaiveDate)>,
 }
 
 struct Charts {
@@ -97,6 +101,7 @@ struct Inputs {
     spot: Entity<InputState>,
     dte: Entity<InputState>,
     iv: Entity<InputState>,
+    long_iv: Entity<InputState>,
     r: Entity<InputState>,
     q: Entity<InputState>,
     skew: Entity<InputState>,
@@ -163,22 +168,23 @@ fn run_job(job: Job) -> Result<Out, String> {
                 None => bundled::prices(&job.sym).and_then(|p| p.bars.last().map(|b| b.close)).ok_or_else(|| format!("沒有 {} 的內建價格：請輸入現價", job.sym))?,
             };
             let t = job.dte.max(1) as f64 / 365.0;
-            let (iv, iv_src) = match job.iv {
-                Some(v) => (v, "手動".to_string()),
-                None => {
-                    let v = bundled::default_vol_index_for(&job.sym).and_then(|v| v.last()).map(|(_, v)| presets::vol_model_for(&job.sym).atm_vol(t, v));
-                    match v {
-                        Some(v) => (v, bundled::default_vol_index_name(&job.sym).to_string()),
-                        None => (0.2, "預設".to_string()),
-                    }
-                }
+            let vm = presets::vol_model_for(&job.sym);
+            let vix_now = bundled::default_vol_index_for(&job.sym).and_then(|v| v.last()).map(|(_, v)| v);
+            let (iv, iv_src) = match (job.iv, vix_now) {
+                (Some(v), _) => (v, "手動".to_string()),
+                (None, Some(v)) => (vm.atm_vol(t, v), bundled::default_vol_index_name(&job.sym).to_string()),
+                (None, None) => (0.2, "預設".to_string()),
             };
-            let m = SyntheticMarket { skew: job.skew, ..SyntheticMarket::new(s, t, job.r, job.q, iv) };
+            // ATM term structure: 2-year IV from the same vol model (keeps the ratio when IV is overridden)
+            let long_iv = job.long_iv.unwrap_or_else(|| vix_now.map(|v| vm.atm_vol(2.0, v) * iv / vm.atm_vol(t, v).max(1e-6)).unwrap_or(iv));
+            let m = SyntheticMarket { skew: job.skew, long_iv, long_t: 2.0, ..SyntheticMarket::new(s, t, job.r, job.q, iv) };
             let exp = today + chrono::Duration::days(job.dte.max(1));
             let label = format!(
-                "合成市場：{} 現價 {s:.2} · ATM IV {:.1}% ({iv_src}) · 偏斜 {:.2} · r {:.2}% · q {:.2}% · {} 天 (到期 {exp})",
+                "合成市場：{} 現價 {s:.2} · ATM IV {:.1}% ({iv_src}, {} 天) → {:.1}% (2 年) · 偏斜 {:.2} · r {:.2}% · q {:.2}% · 預設到期 {} 天 ({exp})",
                 job.sym,
                 iv * 100.0,
+                job.dte.max(1),
+                long_iv * 100.0,
                 job.skew,
                 job.r * 100.0,
                 job.q * 100.0,
@@ -187,12 +193,16 @@ fn run_job(job: Job) -> Result<Out, String> {
             (Market::Synthetic(m), s, label, false, today, exp)
         }
     };
-    let mut opt = match mkt.listed_strikes() {
-        Some(ks) if !ks.is_empty() => CompileOptions::listed(spot, ks),
-        _ => CompileOptions::free(spot),
+    let style = job.style;
+    let opts_for = |days: f64| {
+        let mut opt = match mkt.listed_strikes_for(days) {
+            Some(ks) if !ks.is_empty() => CompileOptions::listed(spot, ks),
+            _ => CompileOptions::free(spot),
+        };
+        opt.style = style;
+        opt
     };
-    opt.style = job.style;
-    let rep = compile(&prog, &opt).map_err(|e| format!("{e:#}"))?;
+    let rep = compile_book(&prog, mkt.default_days(), &opts_for).map_err(|e| format!("{e:#}"))?;
     let priced = price(&prog, &rep, &mkt, job.units, job.mu);
     let (lo, hi) = (spot * 0.4, spot * 1.8);
     let n = 361;
@@ -201,20 +211,34 @@ fn run_job(job: Job) -> Result<Out, String> {
     grid.extend(rep.kinks.iter().copied().filter(|k| *k > lo && *k < hi));
     grid.sort_by(f64::total_cmp);
     grid.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
-    let target = grid.iter().map(|&s| (s, prog.eval(s, spot))).collect();
-    let repl = grid.iter().map(|&s| (s, rep.payoff(s))).collect();
+    // values at the horizon (= the expiry for single-expiry books)
+    let target = grid.iter().map(|&x| (x, priced.horizon_target(&prog, &rep, x))).collect();
+    let repl = grid.iter().map(|&x| (x, priced.horizon_value(x))).collect();
     let t = priced.t;
     let now = value_curve(&priced, &xs, t);
     let mid = value_curve(&priced, &xs, t / 2.0);
-    let legs = rep
+    let default_days = mkt.default_days();
+    let leg_exp: Vec<(String, NaiveDate)> = priced
         .legs
         .iter()
         .map(|l| {
-            let name = format!("{:+.2}×{}", l.qty, instrument_name(l.instrument));
-            (name, grid.iter().map(|&s| (s, l.payoff(s))).collect())
+            let days = l.leg.days.unwrap_or(default_days);
+            let date = mkt.expiry_for_days(days).unwrap_or_else(|| created + chrono::Duration::days(days.round() as i64));
+            let label = if from_chain { date.format("%y-%m-%d").to_string() } else { format!("{:.0}d", (l.t * 365.0).round()) };
+            (label, date)
         })
         .collect();
-    Ok(Out { src: job.src, sym: job.sym, rep, priced, market_label: label, from_chain, created, expiry, lo, hi, target, repl, now, mid, legs })
+    let legs = priced
+        .legs
+        .iter()
+        .zip(&leg_exp)
+        .map(|(l, (el, _))| {
+            let name = format!("{:+.2}×{} @{el}", l.leg.qty, instrument_name(l.leg.instrument));
+            (name, grid.iter().map(|&x| (x, l.value_at(x, t, priced.r, priced.q))).collect())
+        })
+        .collect();
+    let _ = expiry;
+    Ok(Out { src: job.src, sym: job.sym, rep, priced, market_label: label, from_chain, created, lo, hi, target, repl, now, mid, legs, leg_exp })
 }
 
 impl StudioPage {
@@ -229,6 +253,7 @@ impl StudioPage {
             spot: new_input_ph("", "最新收盤", window, cx),
             dte: new_input("120", window, cx),
             iv: new_input_ph("", "自動", window, cx),
+            long_iv: new_input_ph("", "自動", window, cx),
             r: new_input(format!("{:.2}", latest_tbill() * 100.0), window, cx),
             q: new_input(format!("{:.2}", presets::default_dividend_yield(&sym) * 100.0), window, cx),
             skew: new_input("0.30", window, cx),
@@ -240,7 +265,7 @@ impl StudioPage {
                 this.schedule(cx);
             }
         })];
-        for e in [&inp.spot, &inp.dte, &inp.iv, &inp.r, &inp.q, &inp.skew, &inp.units, &inp.mu] {
+        for e in [&inp.spot, &inp.dte, &inp.iv, &inp.long_iv, &inp.r, &inp.q, &inp.skew, &inp.units, &inp.mu] {
             subs.push(cx.subscribe_in(e, window, |this, _, ev: &InputEvent, _, cx| {
                 if let InputEvent::Change = ev {
                     this.schedule(cx);
@@ -300,6 +325,7 @@ impl StudioPage {
         };
         let spot = opt_num(&mut e, "spot", &i.spot, 0.0001, 1e9);
         let iv = opt_num(&mut e, "iv", &i.iv, 1.0, 300.0).map(|v| v / 100.0);
+        let long_iv = opt_num(&mut e, "long_iv", &i.long_iv, 1.0, 300.0).map(|v| v / 100.0);
         let job = Job {
             src: self.editor.read(cx).value().to_string(),
             sym: self.symbol.read(cx).selected_value().map(|s| s.to_string()).unwrap_or_else(|| "QQQ".into()),
@@ -309,6 +335,7 @@ impl StudioPage {
             q: e.num_range("q", &i.q, -10.0, 50.0, cx) / 100.0,
             skew: e.num_range("skew", &i.skew, -3.0, 3.0, cx),
             iv,
+            long_iv,
             units: e.num_range("units", &i.units, 0.0001, 1e9, cx),
             mu: e.num_range("mu", &i.mu, -100.0, 300.0, cx) / 100.0,
             style: self.style,
@@ -363,8 +390,8 @@ impl StudioPage {
             .x_fmt(fmt_auto)
             .x_range(o.lo, o.hi)
             .min_left(CHART_LEFT)
-            .series(Series::line("目標 f(S)", fin(&o.target), p.blue).width(2.6))
-            .series(Series::line("複製 g(S) 到期", fin(&o.repl), p.orange).width(1.4).dashed())
+            .series(Series::line(if pr.multi_expiry { format!("目標 @ {:.0} 天", pr.horizon_days) } else { "目標 f(S)".to_string() }, fin(&o.target), p.blue).width(2.6))
+            .series(Series::line(if pr.multi_expiry { format!("複製部位 @ {:.0} 天", pr.horizon_days) } else { "複製 g(S) 到期".to_string() }, fin(&o.repl), p.orange).width(1.4).dashed())
             .series(Series::line("今日價值", fin(&o.now), p.yellow).width(1.3))
             .series(Series::line("半途價值 (t/2)", fin(&o.mid), p.purple).width(1.1))
             .hline(RefLine::new(cost_ref, p.red).label(format!("損益平衡線 成本×e^rT = {cost_ref:.2}")))
@@ -442,11 +469,12 @@ impl StudioPage {
         let pr = &o.priced;
         let mut strat = Strategy::new(format!("函數工作室：{}", o.src.replace('\n', "; ")), o.sym.clone(), o.created);
         let mut skipped_cash = false;
-        for l in &pr.legs {
+        for (l, (_, exp)) in pr.legs.iter().zip(&o.leg_exp) {
+            let exp = *exp;
             let n = l.leg.qty * pr.units;
             match l.leg.instrument {
-                Instrument::Call(k) => strat.add_leg(Leg::option(OptionKind::Call, k, o.expiry, n / 100.0, l.mid, l.iv)),
-                Instrument::Put(k) => strat.add_leg(Leg::option(OptionKind::Put, k, o.expiry, n / 100.0, l.mid, l.iv)),
+                Instrument::Call(k) => strat.add_leg(Leg::option(OptionKind::Call, k, exp, n / 100.0, l.mid, l.iv)),
+                Instrument::Put(k) => strat.add_leg(Leg::option(OptionKind::Put, k, exp, n / 100.0, l.mid, l.iv)),
                 Instrument::Stock => strat.add_leg(Leg::stock(n, pr.spot)),
                 Instrument::Cash => skipped_cash = true,
             }
@@ -540,6 +568,7 @@ impl StudioPage {
                     .child(f("現價", "spot", &i.spot, 84.0))
                     .child(f("DTE 天", "dte", &i.dte, 62.0))
                     .child(f("ATM IV %", "iv", &i.iv, 70.0))
+                    .child(f("2 年 ATM IV %", "long_iv", &i.long_iv, 84.0))
                     .child(f("r %", "r", &i.r, 58.0))
                     .child(f("q %", "q", &i.q, 58.0))
                     .child(f("偏斜", "skew", &i.skew, 58.0))
@@ -586,12 +615,25 @@ impl StudioPage {
     fn render_middle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let controls = self.render_controls(cx);
         let mut col = v_flex().gap_2().child(controls);
+        let multi = self.out.as_ref().filter(|o| o.priced.multi_expiry).map(|o| o.priced.horizon_days);
+        let (t_main, t_dens, t_dec) = match multi {
+            Some(h) => (
+                format!("最早到期日（{h:.0} 天）時的組合價值：目標 vs 複製 · 今日 / 半途價值（每單位）"),
+                format!("最早到期日（{h:.0} 天）的價格分佈（每 1% 區間機率）· 風險中性 Q vs 真實世界 P"),
+                format!("分解：每條線 = 一個部位在 {h:.0} 天時的價值（較晚到期者為 BS 價值曲線）"),
+            ),
+            None => (
+                "Payoff：目標 f(S) vs 複製 g(S) · 今日 / 半途價值（每單位）".to_string(),
+                "到期價格分佈（每 1% 價格區間的機率）· 風險中性 Q vs 真實世界 P".to_string(),
+                "分解：函數 = 基本元件之和（每條線 = 一個部位的到期損益）".to_string(),
+            ),
+        };
         match &self.charts {
             Some(ch) => {
                 col = col
-                    .child(panel("Payoff：目標 f(S) vs 複製 g(S) · 今日 / 半途價值（每單位）", cx).h(px(360.0)).child(div().flex_1().min_h_0().p_1().child(xy_chart(ch.main.clone()))))
-                    .child(panel("到期價格分佈（每 1% 價格區間的機率）· 風險中性 Q vs 真實世界 P", cx).h(px(170.0)).child(div().flex_1().min_h_0().p_1().child(xy_chart(ch.density.clone()))))
-                    .child(panel("分解：函數 = 基本元件之和（每條線 = 一個部位的到期損益）", cx).h(px(230.0)).child(div().flex_1().min_h_0().p_1().child(xy_chart(ch.decomp.clone()))));
+                    .child(panel(t_main, cx).h(px(360.0)).child(div().flex_1().min_h_0().p_1().child(xy_chart(ch.main.clone()))))
+                    .child(panel(t_dens, cx).h(px(170.0)).child(div().flex_1().min_h_0().p_1().child(xy_chart(ch.density.clone()))))
+                    .child(panel(t_dec, cx).h(px(230.0)).child(div().flex_1().min_h_0().p_1().child(xy_chart(ch.decomp.clone()))));
             }
             None => col = col.child(empty_state(if self.computing { "編譯中…" } else { "輸入函數後自動編譯" }, cx)),
         }
@@ -623,15 +665,21 @@ impl StudioPage {
         let u = pr.units;
         let g = pr.greeks;
         let cols = vec![
-            Col::new("工具", 96.0).left(),
-            Col::new("數量/單位", 70.0),
-            Col::new("口數", 48.0),
-            Col::new("中價", 60.0),
-            Col::new("成交側", 60.0),
-            Col::new("IV", 46.0),
-            Col::new("價值×單位", 76.0),
+            Col::new("工具", 84.0).left(),
+            Col::new("到期", 56.0),
+            Col::new("數量/單位", 60.0),
+            Col::new("口數", 46.0),
+            Col::new("中價", 54.0),
+            Col::new("成交側", 54.0),
+            Col::new("IV", 44.0),
+            Col::new("價值×單位", 66.0),
         ];
-        let legs = pr.legs.iter().enumerate().map(|(i, l)| {
+        // group legs by expiry
+        let mut order: Vec<usize> = (0..pr.legs.len()).collect();
+        order.sort_by(|a, b| pr.legs[*a].t.total_cmp(&pr.legs[*b].t));
+        let legs = order.into_iter().enumerate().map(|(i, li)| {
+            let l = &pr.legs[li];
+            let exp_label = o.leg_exp.get(li).map(|e| e.0.clone()).unwrap_or_default();
             let is_opt = matches!(l.leg.instrument, Instrument::Call(_) | Instrument::Put(_));
             let side = if l.leg.qty >= 0.0 { l.ask } else { l.bid };
             let name = format!("{}{}", instrument_name(l.leg.instrument), if is_opt && !l.quoted && o.from_chain { " 模型價" } else { "" });
@@ -644,7 +692,8 @@ impl StudioPage {
                         Instrument::Put(_) => p.red,
                         _ => p.muted,
                     }),
-                    Cell::new(format!("{:+.4}", l.leg.qty)).color(sign_color(l.leg.qty)),
+                    Cell::new(exp_label).color(p.cyan),
+                    Cell::new(format!("{:+.3}", l.leg.qty)).color(sign_color(l.leg.qty)),
                     Cell::new(if is_opt { format!("{:+.2}", l.leg.qty * u / 100.0) } else { "—".into() }),
                     Cell::new(f2(l.mid)),
                     Cell::new(if is_opt { f2(side) } else { "—".into() }),
@@ -675,7 +724,21 @@ impl StudioPage {
                     v_flex()
                         .p_2()
                         .gap_1()
-                        .child(div().text_size(px(12.0)).font_family(MONO_FONT).text_color(p.text).child(rep.formula()))
+                        .when(rep.groups.len() <= 1, |d| d.child(div().text_size(px(12.0)).font_family(MONO_FONT).text_color(p.text).child(rep.formula())))
+                        .when(rep.groups.len() > 1, |d| {
+                            d.child(muted_text(format!("{} 個到期日 · 分析時點 = 最早到期 {:.0} 天", rep.groups.len(), pr.horizon_days), cx)).children(rep.groups.iter().map(|g| {
+                                v_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(badge(format!("@ {:.0} 天", g.days), p.cyan))
+                                            .child(badge(if g.approximated { "近似" } else { "精確" }, if g.approximated { p.yellow } else { p.green }))
+                                            .child(muted_text(format!("誤差 最大 {:.4} · 平均 {:.4} · {} 部位", g.max_error, g.mean_error, g.n_legs), cx)),
+                                    )
+                                    .child(div().text_size(px(12.0)).font_family(MONO_FONT).text_color(p.text).child(format!("f(S) ≈ {}", g.formula)))
+                            }))
+                        })
                         .child(
                             h_flex()
                                 .gap_2()
@@ -707,7 +770,14 @@ impl StudioPage {
                     .child(kpi_sm("Vega $/點", f2(g.vega * u), None, cx)),
             )
             .child(panel(format!("部位明細（每單位；口數 = 數量 × {} / 100）", f0(u)), cx).child(div().id("studio-legs").max_h(px(260.0)).overflow_y_scroll().child(v_flex().w(px(tw)).child(table_header(&cols, cx)).children(legs))))
-            .child(panel(format!("Q vs P 分佈統計（T = {:.2} 年，μ = {:.0}%）", pr.t, pr.mu * 100.0), cx).child(self.stats_table(&pr.risk_neutral, &pr.real_world, u, cx)))
+            .child(panel(
+                if pr.multi_expiry {
+                    format!("Q vs P 分佈統計 · 最早到期日 {:.0} 天時（μ = {:.0}%）", pr.horizon_days, pr.mu * 100.0)
+                } else {
+                    format!("Q vs P 分佈統計（T = {:.2} 年，μ = {:.0}%）", pr.t, pr.mu * 100.0)
+                },
+                cx,
+            ).child(self.stats_table(&pr.risk_neutral, &pr.real_world, u, cx)))
             .when(!rep.warnings.is_empty() || !rep.snapped.is_empty(), |d| {
                 d.child(
                     panel("警告 Warnings", cx).child(
@@ -739,7 +809,7 @@ impl Render for StudioPage {
             .items_start()
             .child(div().id("studio-left").w(px(340.0)).flex_none().h_full().overflow_y_scroll().border_r_1().border_color(p.border).child(left))
             .child(div().id("studio-mid").flex_1().min_w_0().h_full().overflow_y_scroll().p_2().child(middle))
-            .child(div().id("studio-right").w(px(470.0)).flex_none().h_full().overflow_y_scroll().border_l_1().border_color(p.border).child(right))
+            .child(div().id("studio-right").w(px(484.0)).flex_none().h_full().overflow_y_scroll().border_l_1().border_color(p.border).child(right))
     }
 }
 
