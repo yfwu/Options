@@ -697,12 +697,13 @@ struct PayoffArgs {
 }
 
 fn run_payoff(a: PayoffArgs) -> Result<()> {
-    use optlab_core::payoff::{compile, examples, parse, price, value_curve, CompileOptions, Instrument, LegStyle, Market, StrikeGrid, SyntheticMarket};
+    use optlab_core::payoff::{compile_book, examples, parse, price, value_curve, CompileOptions, Instrument, LegStyle, Market, StrikeGrid, SyntheticMarket};
     if a.examples {
         println!("Payoff 語言：S = 到期價格，spot = 現價，110% = 1.10×spot；+ - * / ^；變數 a = 600；以 ; 或換行分隔");
         println!("基本元件：call(K) put(K) digital(K) digitalput(K) pwl(x1,y1,x2,y2,…)");
         println!("巨集：straddle(K) strangle(Kp,Kc) bull(K1,K2) bear(K1,K2) butterfly(K1,K2,K3) condor(K1..K4) collar(Kp,Kc) protect(K)");
-        println!("函數：max min abs pos neg clamp(x,lo,hi) sqrt ln exp\n");
+        println!("函數：max min abs pos neg clamp(x,lo,hi) sqrt ln exp");
+        println!("跨到期日：expr @ N（天，可加 d/w/m/y：@ 45、@ 6m、@ 1y）；未標記的部分用 --days；不同到期日之間只能 + − 與常數倍數\n");
         for (name, src, note) in examples() {
             println!("■ {name}\n  {}\n  {note}\n", src.replace('\n', "; "));
         }
@@ -747,34 +748,43 @@ fn run_payoff(a: PayoffArgs) -> Result<()> {
     } else {
         let px = bundled::prices(&a.symbol);
         let s = a.spot.or_else(|| px.as_ref().and_then(|p| p.bars.last().map(|b| b.close))).context("請用 --spot 指定現價")?;
-        let iv = a.iv.unwrap_or_else(|| {
-            bundled::default_vol_index_for(&a.symbol)
-                .and_then(|v| v.last())
-                .map(|(_, v)| presets::vol_model_for(&a.symbol).atm_vol(a.days as f64 / 365.0, v))
-                .unwrap_or(0.2)
-        });
+        let vm = presets::vol_model_for(&a.symbol);
+        let vix_now = bundled::default_vol_index_for(&a.symbol).and_then(|v| v.last()).map(|(_, v)| v);
+        let iv = a.iv.unwrap_or_else(|| vix_now.map(|v| vm.atm_vol(a.days as f64 / 365.0, v)).unwrap_or(0.2));
+        // term structure: 2-year ATM from the same vol model (keeps the ratio when --iv overrides)
+        let long_iv = vix_now.map(|v| vm.atm_vol(2.0, v) * iv / vm.atm_vol(a.days as f64 / 365.0, v).max(1e-6)).unwrap_or(iv);
         let q = a.div.unwrap_or_else(|| presets::default_dividend_yield(&a.symbol));
-        println!("合成市場：{} 現價 {s:.2}  ATM IV {:.1}%  偏斜 {:.2}  r {:.2}%  q {:.2}%  {} 天", a.symbol, iv * 100.0, a.skew, r * 100.0, q * 100.0, a.days);
-        let m = SyntheticMarket { skew: a.skew, ..SyntheticMarket::new(s, a.days.max(1) as f64 / 365.0, r, q, iv) };
+        println!("合成市場：{} 現價 {s:.2}  ATM IV {:.1}%（{} 天）→ {:.1}%（2 年）  偏斜 {:.2}  r {:.2}%  q {:.2}%", a.symbol, iv * 100.0, a.days, long_iv * 100.0, a.skew, r * 100.0, q * 100.0);
+        let m = SyntheticMarket { skew: a.skew, long_iv, long_t: 2.0, ..SyntheticMarket::new(s, a.days.max(1) as f64 / 365.0, r, q, iv) };
         (Market::Synthetic(m), s)
     };
-    let mut opt = match mkt.listed_strikes() {
-        Some(ks) => CompileOptions::listed(spot, ks),
-        None => CompileOptions::free(spot),
+    let opts_for = |days: f64| {
+        let mut opt = match mkt.listed_strikes_for(days) {
+            Some(ks) => CompileOptions::listed(spot, ks),
+            None => CompileOptions::free(spot),
+        };
+        if let (Some(st), StrikeGrid::Free { .. }) = (a.step, &opt.grid) {
+            opt.grid = StrikeGrid::Free { step: st };
+        }
+        opt.style = style;
+        opt
     };
-    if let (Some(st), StrikeGrid::Free { .. }) = (a.step, &opt.grid) {
-        opt.grid = StrikeGrid::Free { step: st };
-    }
-    opt.style = style;
-    let rep = compile(&prog, &opt)?;
+    let rep = compile_book(&prog, mkt.default_days(), &opts_for)?;
     let px = price(&prog, &rep, &mkt, a.units, a.mu);
 
-    println!("\n編譯結果  f(S) ≈ {}", rep.formula());
+    if rep.groups.len() > 1 {
+        println!("\n編譯結果（{} 個到期日；分析時點 = 最早到期 {} 天）", rep.groups.len(), px.horizon_days);
+        for g in &rep.groups {
+            println!("  @ {:>4} 天  f(S) ≈ {}", g.days, g.formula);
+        }
+    } else {
+        println!("\n編譯結果  f(S) ≈ {}", rep.formula());
+    }
     println!("複製誤差：最大 {:.4}  平均 {:.4}（區間 {:.0}–{:.0}）{}", rep.max_error, rep.mean_error, spot * 0.5, spot * 1.6, if rep.approximated { "  [近似]" } else if !rep.snapped.is_empty() { "  [形狀精確，履約價取整]" } else { "  [精確]" });
     for w in &rep.warnings {
         println!("  ⚠ {w}");
     }
-    println!("\n{:<14} {:>10} {:>10} {:>10} {:>10} {:>8} {:>12}   (× {} 單位 = 口數 {})", "工具", "數量/單位", "中價", "買/賣價", "成交價值", "IV", "部位價值", a.units, a.units / 100.0);
+    println!("\n{:<14} {:>6} {:>10} {:>10} {:>10} {:>10} {:>8} {:>12}   (× {} 單位 = 口數 {})", "工具", "到期天", "數量/單位", "中價", "買/賣價", "成交價值", "IV", "部位價值", a.units, a.units / 100.0);
     for l in &px.legs {
         let name = match l.leg.instrument {
             Instrument::Cash => "零息債/現金".to_string(),
@@ -784,8 +794,9 @@ fn run_payoff(a: PayoffArgs) -> Result<()> {
         };
         let side = if l.leg.qty >= 0.0 { l.ask } else { l.bid };
         println!(
-            "{:<14} {:>10.4} {:>10.3} {:>10.3} {:>10.3} {:>7} {:>12.2}{}",
+            "{:<14} {:>6.0} {:>10.4} {:>10.3} {:>10.3} {:>10.3} {:>7} {:>12.2}{}",
             name,
+            l.t * 365.0,
             l.leg.qty,
             l.mid,
             side,
@@ -808,6 +819,9 @@ fn run_payoff(a: PayoffArgs) -> Result<()> {
         "Greeks（每單位）：Δ {:.3}  Γ {:.5}  Θ {:.4}/天  Vega {:.4}/vol點    （×{}：Δ {:.1} 股）",
         px.greeks.delta, px.greeks.gamma, px.greeks.theta, px.greeks.vega, a.units, px.greeks.delta * a.units
     );
+    if px.multi_expiry {
+        println!("（以下統計為最早到期日 {} 天時整個組合的價值；較晚到期部位以 BS 估值）", px.horizon_days);
+    }
     for (name, st) in [("風險中性 Q", &px.risk_neutral), (&*format!("真實世界 P (μ={:.0}%)", px.mu * 100.0), &px.real_world)] {
         println!(
             "{:<20} 期望收益 {:>9.3}  期望損益 {:>8.3}  獲利機率 {:>5.1}%  收益 P5/P50/P95 {:.2} / {:.2} / {:.2}",

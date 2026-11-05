@@ -35,6 +35,7 @@ cap = 115%
 | 基本元件 | `call(K)` `put(K)` `digital(K)` `digitalput(K)` `pwl(x1,y1, x2,y2, …)`（用點直接畫折線） |
 | 巨集 | `straddle(K)` `strangle(Kp,Kc)` `bull(K1,K2)` `bear(K1,K2)` `butterfly(K1,K2,K3)` `condor(…)` `collar(Kp,Kc)` `protect(K)` |
 | 運算 | `+ - * / ^`、`max min abs pos neg clamp sqrt ln exp` |
+| 跨到期日 | `expr @ N`：這部分在 N 天後到期，可加單位 `d/w/m/y`（`@ 45`、`@ 6m`、`@ 1y`）；未標記的部分用預設 DTE。不同到期日之間只能做線性組合（`+ − ×常數`） |
 
 **編譯原理（靜態複製）：** 任何分段線性函數都可以精確寫成
 
@@ -51,6 +52,20 @@ f(S) = a + b·S + Σᵢ wᵢ·(S − Kᵢ)⁺
 - **可交易履約價**：轉折點會對齊到可交易履約價，取整誤差會顯示出來。
 - **跳躍**：數位選擇權這類跳躍，以相鄰履約價的窄價差近似。
 - **平滑函數**：`ln`、`S²` 這類函數在履約價網格上做分段線性近似（Carr–Madan），並顯示近似誤差。
+
+**跨到期日組合（日曆、對角、PMCC）：**
+
+```text
+call(80%) @ 540 - call(105%) @ 45          # PMCC：18 個月深價內 LEAPS + 每月賣 105% 買權
+call(100%) @ 90 - call(100%) @ 30          # 日曆價差
+strangle(95%, 105%) @ 60 - strangle(95%, 105%) @ 30   # 雙日曆
+```
+
+- 編譯器把程式拆成「每個到期日一組」，每組在自己的到期日上編譯；用真實期權鏈時，各組使用該到期日的掛牌履約價。
+- 分析時點是**最早的到期日**：到期的部位按內在價值計，還沒到期的部位用 Black–Scholes（固定履約價的 IV）估值，得到「最早到期日時的組合價值 h(S)」。價格、分佈、獲利機率和損益兩平都以 h(S) 為準。
+- 合成市場有 ATM 期限結構：近月 IV 與 2 年 IV 之間以總變異數內插。
+- 像 `max(call@30, call@90)` 這種跨到期日的非線性組合是複合（路徑相依）選擇權，靜態複製表達不了，編譯器會直接報錯。
+- 近月賣出的買權如果由遠月多頭部位覆蓋，會提示這是「備兌」，而不是裸賣。
 
 **定價與分析：**
 - 價格：中價與可成交價（買在 ask、賣在 bid）。
@@ -70,6 +85,10 @@ f(S) = a + b·S + Σᵢ wᵢ·(S − Kᵢ)⁺
 
 ```bash
 ./target/release/optlab payoff "pwl(80%,-10, 100%,0, 120%,40)" --chain-file my_snapshot.json
+```
+
+```bash
+./target/release/optlab payoff "call(80%) @ 540 - call(105%) @ 45" --symbol QQQ
 ```
 
 ![平滑函數的近似複製](docs/screenshots/studio_smooth.png)

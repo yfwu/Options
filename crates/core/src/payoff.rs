@@ -119,6 +119,8 @@ pub enum Expr {
     Div(Box<Expr>, Box<Expr>),
     Pow(Box<Expr>, Box<Expr>),
     Fn(Func, Vec<Expr>),
+    /// `expr @ days` — the sub-payoff settles at its own expiry (calendar days from now).
+    At(Box<Expr>, f64),
 }
 
 /// Evaluation context.
@@ -150,6 +152,20 @@ impl Expr {
             }
             Pow(a, b) => a.eval(ctx).powf(b.eval(ctx)),
             Fn(f, args) => eval_fn(*f, args, ctx),
+            // single-expiry view: an expiry tag is transparent
+            At(a, _) => a.eval(ctx),
+        }
+    }
+
+    /// True when any sub-expression carries an expiry tag (`@`).
+    pub fn has_expiry_tag(&self) -> bool {
+        use Expr::*;
+        match self {
+            At(..) => true,
+            Num(_) | S | Spot => false,
+            Neg(a) => a.has_expiry_tag(),
+            Add(a, b) | Sub(a, b) | Mul(a, b) | Div(a, b) | Pow(a, b) => a.has_expiry_tag() || b.has_expiry_tag(),
+            Fn(_, args) => args.iter().any(|a| a.has_expiry_tag()),
         }
     }
 
@@ -159,7 +175,7 @@ impl Expr {
         match self {
             Num(_) | Spot => true,
             S => false,
-            Neg(a) => a.is_const(),
+            Neg(a) | At(a, _) => a.is_const(),
             Add(a, b) | Sub(a, b) | Mul(a, b) | Div(a, b) | Pow(a, b) => a.is_const() && b.is_const(),
             Fn(f, args) => {
                 !matches!(f, Func::Call | Func::Put | Func::Digital | Func::DigitalPut | Func::Pwl | Func::Straddle | Func::Strangle | Func::Bull | Func::Bear | Func::Butterfly | Func::Condor | Func::Collar | Func::Protect)
@@ -282,7 +298,7 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>> {
                 i += 1;
             }
             out.push((Tok::Ident(c[st..i].iter().collect()), st));
-        } else if "+-*/^(),=%".contains(ch) {
+        } else if "+-*/^(),=%@".contains(ch) {
             out.push((Tok::Op(ch), i));
             i += 1;
         } else if ch == '×' || ch == '·' {
@@ -372,11 +388,50 @@ impl Parser<'_> {
     }
     fn postfix(&mut self) -> Result<Expr> {
         let mut e = self.atom()?;
-        while self.eat_op('%') {
-            // x% = x/100 × spot
-            e = Expr::Mul(Box::new(Expr::Div(Box::new(e), Box::new(Expr::Num(100.0)))), Box::new(Expr::Spot));
+        loop {
+            if self.eat_op('%') {
+                // x% = x/100 × spot
+                e = Expr::Mul(Box::new(Expr::Div(Box::new(e), Box::new(Expr::Num(100.0)))), Box::new(Expr::Spot));
+            } else if self.eat_op('@') {
+                e = Expr::At(Box::new(e), self.expiry_days()?);
+            } else {
+                return Ok(e);
+            }
         }
-        Ok(e)
+    }
+    /// Expiry after `@`: a number of calendar days with an optional unit d / w / m / y
+    /// (`@ 45`, `@ 45d`, `@ 6m`, `@ 1y`), or a variable holding a number.
+    fn expiry_days(&mut self) -> Result<f64> {
+        let at = self.at();
+        let n = match self.peek().cloned() {
+            Some(Tok::Num(v)) => {
+                self.pos += 1;
+                v
+            }
+            Some(Tok::Op('(')) | Some(Tok::Ident(_)) => {
+                let e = self.atom()?;
+                if !e.is_const() || e.has_expiry_tag() {
+                    bail!("位置 {at}: @ 後面要是天數（常數）");
+                }
+                e.eval(Ctx { s: 0.0, spot: 0.0 })
+            }
+            _ => bail!("位置 {at}: @ 後面要接到期天數，例如 @ 45 或 @ 6m"),
+        };
+        let mult = match self.peek().cloned() {
+            Some(Tok::Ident(u)) if matches!(u.as_str(), "d" | "D") => 1.0,
+            Some(Tok::Ident(u)) if matches!(u.as_str(), "w" | "W") => 7.0,
+            Some(Tok::Ident(u)) if matches!(u.as_str(), "m" | "M") => 30.4375,
+            Some(Tok::Ident(u)) if matches!(u.as_str(), "y" | "Y") => 365.0,
+            _ => 0.0,
+        };
+        if mult > 0.0 {
+            self.pos += 1;
+        }
+        let days = (n * if mult > 0.0 { mult } else { 1.0 }).round();
+        if !(1.0..=3650.0).contains(&days) {
+            bail!("位置 {at}: 到期天數需在 1–3650 天之間（收到 {days}）");
+        }
+        Ok(days)
     }
     fn atom(&mut self) -> Result<Expr> {
         let at = self.at();
@@ -434,9 +489,75 @@ pub struct Program {
 }
 
 impl Program {
+    /// Single-expiry evaluation (expiry tags are ignored). For programs with several
+    /// expiries use [`Program::expiry_groups`] / [`compile_book`].
     pub fn eval(&self, s: f64, spot: f64) -> f64 {
         self.expr.eval(Ctx { s, spot })
     }
+
+    /// True when the program uses `@` expiry tags.
+    pub fn is_multi_expiry(&self) -> bool {
+        self.expr.has_expiry_tag()
+    }
+
+    /// Split the program into `(expiry_days, payoff_at_that_expiry)` groups, sorted by
+    /// expiry. Untagged parts settle at `default_days`. Groups with different expiries may
+    /// only be combined linearly (`+ − × constant ÷ constant`); anything else would be a
+    /// compound / path-dependent option and is rejected.
+    pub fn expiry_groups(&self, default_days: f64) -> Result<Vec<(f64, Expr)>> {
+        let terms = split_terms(&self.expr)?;
+        let mut groups: Vec<(f64, Expr)> = Vec::new();
+        for (d, e) in terms {
+            let d = d.unwrap_or(default_days.round().max(1.0));
+            match groups.iter_mut().find(|g| (g.0 - d).abs() < 0.5) {
+                Some(g) => g.1 = Expr::Add(Box::new(std::mem::replace(&mut g.1, Expr::Num(0.0))), Box::new(e)),
+                None => groups.push((d, e)),
+            }
+        }
+        groups.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        Ok(groups)
+    }
+}
+
+type Terms = Vec<(Option<f64>, Expr)>;
+
+fn scale_terms(t: Terms, k: Expr) -> Terms {
+    t.into_iter().map(|(d, e)| (d, Expr::Mul(Box::new(k.clone()), Box::new(e)))).collect()
+}
+
+/// Linear decomposition into single-expiry terms.
+fn split_terms(e: &Expr) -> Result<Terms> {
+    use Expr::*;
+    if !e.has_expiry_tag() {
+        return Ok(vec![(None, e.clone())]);
+    }
+    Ok(match e {
+        At(inner, d) => {
+            let mut out = Vec::new();
+            for (d2, x) in split_terms(inner)? {
+                match d2 {
+                    Some(d2) if (d2 - d).abs() > 0.5 => bail!("巢狀的 @ 到期日互相衝突（{d2} 天 vs {d} 天）"),
+                    _ => out.push((Some(*d), x)),
+                }
+            }
+            out
+        }
+        Add(a, b) => {
+            let mut v = split_terms(a)?;
+            v.extend(split_terms(b)?);
+            v
+        }
+        Sub(a, b) => {
+            let mut v = split_terms(a)?;
+            v.extend(scale_terms(split_terms(b)?, Num(-1.0)));
+            v
+        }
+        Neg(a) => scale_terms(split_terms(a)?, Num(-1.0)),
+        Mul(a, b) if a.is_const() && !a.has_expiry_tag() => scale_terms(split_terms(b)?, (**a).clone()),
+        Mul(a, b) if b.is_const() && !b.has_expiry_tag() => scale_terms(split_terms(a)?, (**b).clone()),
+        Div(a, b) if b.is_const() && !b.has_expiry_tag() => scale_terms(split_terms(a)?, Div(Box::new(Num(1.0)), b.clone())),
+        _ => bail!("不同到期日的部分只能用 + − 和常數倍數組合（例如 call(80%) @ 540 − call(105%) @ 45）；max/min/乘積等跨到期日的組合屬於複合/路徑相依選擇權，靜態複製無法表達"),
+    })
 }
 
 /// Parse a payoff program. Statements are separated by `;` or new lines; `name = expr`
@@ -491,6 +612,10 @@ pub enum Instrument {
 pub struct RepLeg {
     pub instrument: Instrument,
     pub qty: f64,
+    /// Expiry in calendar days from now (set by [`compile_book`]); `None` = the market's
+    /// default expiry. Cash legs pay and stock legs are unwound at this date.
+    #[serde(default)]
+    pub days: Option<f64>,
 }
 
 impl RepLeg {
@@ -581,6 +706,23 @@ pub struct Replication {
     /// Strikes moved by snapping (original, snapped).
     pub snapped: Vec<(f64, f64)>,
     pub warnings: Vec<String>,
+    /// Per-expiry summary (one entry per `@` group; a single entry for plain programs
+    /// compiled with [`compile_book`], empty for [`compile`]).
+    #[serde(default)]
+    pub groups: Vec<GroupSummary>,
+}
+
+/// One expiry group of a compiled book.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroupSummary {
+    pub days: f64,
+    /// The group's payoff at its own expiry.
+    pub expr: Expr,
+    pub formula: String,
+    pub max_error: f64,
+    pub mean_error: f64,
+    pub approximated: bool,
+    pub n_legs: usize,
 }
 
 impl Replication {
@@ -710,10 +852,15 @@ pub fn compile(prog: &Program, opt: &CompileOptions) -> Result<Replication> {
     // unless another candidate is clearly (>5%) better.
     let anchor_shift = if rep_needs_anchor(&opt.grid) && !snapped.is_empty() {
         let (lo, hi) = (opt.error_range.0 * spot, opt.error_range.1 * spot);
-        let xs: Vec<f64> = (0..=400).map(|i| lo + (hi - lo) * i as f64 / 400.0).collect();
+        // log-spaced grid so the lognormal-ish weight below is symmetric around spot
+        let (llo, lhi) = (lo.max(1e-9).ln(), hi.ln());
+        let xs: Vec<f64> = (0..=400).map(|i| (llo + (lhi - llo) * i as f64 / 400.0).exp()).collect();
         let fx: Vec<f64> = xs.iter().map(|&x| f(x)).collect();
         let gx: Vec<f64> = xs.iter().map(|&x| g_at(x)).collect();
-        let mean_err = |c: f64| fx.iter().zip(&gx).map(|(a, b)| (a - b - c).abs()).sum::<f64>() / xs.len() as f64;
+        // weight errors by a lognormal-ish bump around spot (where the probability mass is)
+        let wts: Vec<f64> = xs.iter().map(|&x| (-(x / spot).ln().powi(2) / (2.0 * 0.25 * 0.25)).exp()).collect();
+        let wsum: f64 = wts.iter().sum();
+        let mean_err = |c: f64| fx.iter().zip(&gx).zip(&wts).map(|((a, b), w)| w * (a - b - c).abs()).sum::<f64>() / wsum;
         let mut cands = vec![f(spot) - g_at(spot)];
         let mut bounds: Vec<f64> = vec![lo];
         bounds.extend(merged.iter().map(|n| n.0).filter(|k| *k > lo && *k < hi));
@@ -725,7 +872,7 @@ pub fn compile(prog: &Program, opt: &CompileOptions) -> Result<Replication> {
         let base = mean_err(0.0);
         let best = cands.into_iter().map(|c| (c, mean_err(c))).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         match best {
-            Some((c, e)) if e < 0.95 * base => c,
+            Some((c, e)) if e < 0.9 * base => c,
             _ => 0.0,
         }
     } else {
@@ -775,23 +922,23 @@ pub fn compile(prog: &Program, opt: &CompileOptions) -> Result<Replication> {
         };
         if as_put {
             // w (S−K)⁺ = w (K−S)⁺ + w S − w K
-            legs.push(RepLeg { instrument: Instrument::Put(k), qty: w });
+            legs.push(RepLeg { instrument: Instrument::Put(k), qty: w, days: None });
             stock += w;
             cash -= w * k;
         } else {
-            legs.push(RepLeg { instrument: Instrument::Call(k), qty: w });
+            legs.push(RepLeg { instrument: Instrument::Call(k), qty: w, days: None });
         }
     }
     let mut all = Vec::new();
     if cash.abs() > 1e-9 * (1.0 + spot) {
-        all.push(RepLeg { instrument: Instrument::Cash, qty: cash });
+        all.push(RepLeg { instrument: Instrument::Cash, qty: cash, days: None });
     }
     if stock.abs() > 1e-9 {
-        all.push(RepLeg { instrument: Instrument::Stock, qty: stock });
+        all.push(RepLeg { instrument: Instrument::Stock, qty: stock, days: None });
     }
     all.extend(legs);
 
-    let mut rep = Replication { legs: all, kinks: merged.iter().map(|n| n.0).collect(), max_error: 0.0, mean_error: 0.0, approximated, snapped, warnings: Vec::new() };
+    let mut rep = Replication { legs: all, kinks: merged.iter().map(|n| n.0).collect(), max_error: 0.0, mean_error: 0.0, approximated, snapped, warnings: Vec::new(), groups: Vec::new() };
     // error
     let (lo, hi) = (opt.error_range.0 * spot, opt.error_range.1 * spot);
     let n = 2000;
@@ -824,6 +971,57 @@ pub fn compile(prog: &Program, opt: &CompileOptions) -> Result<Replication> {
     }
     rep.warnings = warnings;
     Ok(rep)
+}
+
+/// Compile a (possibly multi-expiry) program: every `@` group is compiled at its own
+/// expiry with the options returned by `opts_for(days)` (e.g. the listed strikes of that
+/// expiry), and the legs are merged with their `days` set. Single-expiry programs give
+/// exactly the legs of [`compile`] with `days = Some(default_days)`.
+pub fn compile_book(prog: &Program, default_days: f64, opts_for: &dyn Fn(f64) -> CompileOptions) -> Result<Replication> {
+    let groups = prog.expiry_groups(default_days)?;
+    let multi = groups.len() > 1;
+    let mut out = Replication { legs: Vec::new(), kinks: Vec::new(), max_error: 0.0, mean_error: 0.0, approximated: false, snapped: Vec::new(), warnings: Vec::new(), groups: Vec::new() };
+    let mut mean_sum = 0.0;
+    for (days, expr) in &groups {
+        let sub = Program { source: String::new(), expr: expr.clone() };
+        let r = compile(&sub, &opts_for(*days)).map_err(|e| anyhow!("到期 {days:.0} 天的部分：{e}"))?;
+        out.max_error = out.max_error.max(r.max_error);
+        mean_sum += r.mean_error;
+        out.approximated |= r.approximated;
+        out.snapped.extend(r.snapped.iter().copied());
+        out.kinks.extend(r.kinks.iter().copied());
+        for w in &r.warnings {
+            if multi && w.starts_with("S→∞") {
+                continue; // judged on the combined book below
+            }
+            out.warnings.push(if multi { format!("[{days:.0} 天] {w}") } else { w.clone() });
+        }
+        out.groups.push(GroupSummary { days: *days, expr: expr.clone(), formula: r.formula(), max_error: r.max_error, mean_error: r.mean_error, approximated: r.approximated, n_legs: r.legs.len() });
+        out.legs.extend(r.legs.into_iter().map(|l| RepLeg { days: Some(*days), ..l }));
+    }
+    out.mean_error = mean_sum / groups.len().max(1) as f64;
+    out.kinks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    out.kinks.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    if multi {
+        let rs: f64 = out.legs.iter().map(|l| match l.instrument {
+            Instrument::Stock | Instrument::Call(_) => l.qty,
+            _ => 0.0,
+        }).sum();
+        let earliest_short_calls: f64 = out.legs.iter().filter(|l| l.days == Some(groups[0].0)).map(|l| match l.instrument {
+            Instrument::Stock | Instrument::Call(_) => l.qty,
+            _ => 0.0,
+        }).sum();
+        if rs < -1e-9 {
+            out.warnings.push(format!("整體 S→∞ 斜率為 {rs:.2}：上方虧損無上限"));
+        } else if earliest_short_calls < -1e-9 {
+            out.warnings.push("近月賣出的買權由較晚到期的多頭部位覆蓋（備兌）；若遠月部位先被平倉則變成裸賣".into());
+        }
+        out.warnings.push(format!(
+            "跨到期日組合：在最早到期日（{:.0} 天）時，較晚到期的部位以 Black–Scholes 按當時價格估值（固定履約價的 IV），結果依賴波動率假設",
+            groups[0].0
+        ));
+    }
+    Ok(out)
 }
 
 fn rep_needs_anchor(grid: &StrikeGrid) -> bool {
@@ -910,11 +1108,13 @@ fn detect_kinks(f: &dyn Fn(f64) -> f64, lo: f64, hi: f64) -> Option<Kinks> {
 // Pricing
 // ---------------------------------------------------------------------------
 
-/// Synthetic market with a parametric equity smile (see [`SyntheticMarket::iv`]).
+/// Synthetic market with a parametric equity smile (see [`SyntheticMarket::iv_t`]) and
+/// an ATM term structure interpolated in total variance between `(t, atm_iv)` and
+/// `(long_t, long_iv)`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SyntheticMarket {
     pub spot: f64,
-    /// Years to expiry.
+    /// Default expiry in years (the tenor of `atm_iv`).
     pub t: f64,
     pub r: f64,
     pub q: f64,
@@ -924,22 +1124,50 @@ pub struct SyntheticMarket {
     pub curv: f64,
     /// Half bid/ask spread as a fraction of mid (min $0.05).
     pub half_spread_pct: f64,
+    /// ATM IV at `long_t` years (term structure). 0 ⇒ flat at `atm_iv`.
+    #[serde(default)]
+    pub long_iv: f64,
+    /// Tenor of `long_iv` in years (default 2).
+    #[serde(default)]
+    pub long_t: f64,
 }
 
 impl SyntheticMarket {
     pub fn new(spot: f64, t: f64, r: f64, q: f64, atm_iv: f64) -> Self {
-        Self { spot, t, r, q, atm_iv, skew: 0.30, curv: 0.03, half_spread_pct: 0.01 }
+        Self { spot, t, r, q, atm_iv, skew: 0.30, curv: 0.03, half_spread_pct: 0.01, long_iv: atm_iv, long_t: 2.0 }
     }
     pub fn forward(&self) -> f64 {
-        self.spot * ((self.r - self.q) * self.t).exp()
+        self.forward_t(self.t)
     }
-    /// Smile `atm·exp(−skew·x·w(x) + curv·x²)` with `x = ln(K/F)/√T` clamped to ±3 and
-    /// the call wing 60% flatter (`w = 0.4` for x > 0) — positive and arbitrage-benign in
-    /// the wings, unlike a linear skew.
-    pub fn iv(&self, k: f64) -> f64 {
-        let x = ((k / self.forward()).ln() / self.t.max(1e-6).sqrt()).clamp(-3.0, 3.0);
+    pub fn forward_t(&self, tau: f64) -> f64 {
+        self.spot * ((self.r - self.q) * tau).exp()
+    }
+    /// ATM implied vol at tenor `tau` (years): flat before `t` and after `long_t`, linear in
+    /// total variance in between.
+    pub fn atm_t(&self, tau: f64) -> f64 {
+        let lt = if self.long_t > 0.0 { self.long_t } else { 2.0 };
+        if self.long_iv <= 0.0 || (lt - self.t).abs() < 1e-6 || tau <= self.t.min(lt) {
+            return if self.long_iv > 0.0 && tau >= lt.max(self.t) && lt > self.t { self.long_iv } else { self.atm_iv };
+        }
+        let (t0, v0, t1, v1) = if self.t < lt { (self.t, self.atm_iv, lt, self.long_iv) } else { (lt, self.long_iv, self.t, self.atm_iv) };
+        if tau >= t1 {
+            return v1;
+        }
+        let w = v0 * v0 * t0 + (tau - t0) / (t1 - t0) * (v1 * v1 * t1 - v0 * v0 * t0);
+        (w.max(1e-8) / tau).sqrt()
+    }
+    /// Smile at tenor `tau`: `atm(τ)·exp(−skew·x·w(x) + curv·x²)` with `x = ln(K/F_τ)/√τ`
+    /// clamped to ±3 and the call wing 60% flatter (`w = 0.4` for x > 0) — positive and
+    /// arbitrage-benign in the wings, unlike a linear skew.
+    pub fn iv_t(&self, k: f64, tau: f64) -> f64 {
+        let tau = tau.max(1.0 / 365.0);
+        let x = ((k / self.forward_t(tau)).ln() / tau.sqrt()).clamp(-3.0, 3.0);
         let w = if x > 0.0 { 0.4 } else { 1.0 };
-        (self.atm_iv * (-self.skew * x * w + self.curv * x * x).exp()).clamp(0.03, 3.0)
+        (self.atm_t(tau) * (-self.skew * x * w + self.curv * x * x).exp()).clamp(0.03, 3.0)
+    }
+    /// Smile at the default tenor.
+    pub fn iv(&self, k: f64) -> f64 {
+        self.iv_t(k, self.t)
     }
 }
 
@@ -947,6 +1175,7 @@ impl SyntheticMarket {
 #[derive(Debug, Clone)]
 pub enum Market {
     Synthetic(SyntheticMarket),
+    /// A real chain; `expiry` is the default expiry (untagged parts of a program).
     Chain { chain: OptionChain, expiry: NaiveDate, r: f64, q: f64, surface: VolSurface },
 }
 
@@ -961,11 +1190,16 @@ impl Market {
             Market::Chain { chain, .. } => chain.spot,
         }
     }
+    /// Default expiry in years.
     pub fn t(&self) -> f64 {
         match self {
             Market::Synthetic(m) => m.t,
             Market::Chain { chain, expiry, .. } => ((*expiry - chain.as_of_date()).num_days().max(1) as f64) / 365.0,
         }
+    }
+    /// Default expiry in calendar days.
+    pub fn default_days(&self) -> f64 {
+        (self.t() * 365.0).round()
     }
     pub fn r(&self) -> f64 {
         match self {
@@ -979,14 +1213,51 @@ impl Market {
             Market::Chain { q, .. } => *q,
         }
     }
-    /// Listed strikes available for compilation (chain) or `None` (synthetic).
+    /// Listed expiry nearest to `days` (chain mode).
+    pub fn expiry_for_days(&self, days: f64) -> Option<NaiveDate> {
+        match self {
+            Market::Chain { chain, .. } => chain.expiry_near_dte(days.round() as i64),
+            _ => None,
+        }
+    }
+    /// Years to the expiry used for a leg settling in `days` (snapped to a listed expiry
+    /// in chain mode).
+    pub fn t_for_days(&self, days: f64) -> f64 {
+        match self {
+            Market::Synthetic(_) => days.max(1.0) / 365.0,
+            Market::Chain { chain, .. } => self
+                .expiry_for_days(days)
+                .map(|e| ((e - chain.as_of_date()).num_days().max(1) as f64) / 365.0)
+                .unwrap_or(days.max(1.0) / 365.0),
+        }
+    }
+    /// Listed strikes of the default expiry (chain) or `None` (synthetic).
     pub fn listed_strikes(&self) -> Option<Vec<f64>> {
         match self {
             Market::Chain { chain, expiry, .. } => Some(chain.strikes(*expiry)),
             _ => None,
         }
     }
-    /// Model implied vol at strike `k` (smile).
+    /// Listed strikes of the expiry nearest to `days` (chain) or `None` (synthetic).
+    pub fn listed_strikes_for(&self, days: f64) -> Option<Vec<f64>> {
+        match self {
+            Market::Chain { chain, .. } => self.expiry_for_days(days).map(|e| chain.strikes(e)),
+            _ => None,
+        }
+    }
+    /// Model implied vol at strike `k` and tenor `t` (years).
+    pub fn iv_t(&self, k: f64, t: f64) -> f64 {
+        match self {
+            Market::Synthetic(m) => m.iv_t(k, t),
+            Market::Chain { surface, chain, expiry, .. } => surface
+                .iv(k, t)
+                .or_else(|| chain.atm_iv(*expiry))
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(0.2)
+                .clamp(0.03, 3.0),
+        }
+    }
+    /// Model implied vol at strike `k` for the default expiry.
     pub fn iv(&self, k: f64) -> f64 {
         match self {
             Market::Synthetic(m) => m.iv(k),
@@ -998,24 +1269,61 @@ impl Market {
                 .clamp(0.03, 3.0),
         }
     }
-    /// (mid, bid, ask, iv, from_quote) of one option.
+    /// (mid, bid, ask, iv, from_quote) of one option at the default expiry.
     pub fn option_quote(&self, kind: OptionKind, k: f64) -> (f64, f64, f64, f64, bool) {
-        let (s, t, r, q) = (self.spot(), self.t(), self.r(), self.q());
-        if let Market::Chain { chain, expiry, .. } = self {
-            if let Some(qt) = chain.find(*expiry, k, kind) {
-                if qt.bid > 0.0 && qt.ask >= qt.bid {
-                    let iv = qt.iv.filter(|v| *v > 0.0).unwrap_or_else(|| self.iv(k));
-                    return (qt.mid(), qt.bid, qt.ask, iv, true);
+        let (m, b, a, iv, qd, _) = self.option_quote_days(kind, k, self.default_days());
+        (m, b, a, iv, qd)
+    }
+    /// (mid, bid, ask, iv, from_quote, t_years) of one option settling in `days`.
+    pub fn option_quote_days(&self, kind: OptionKind, k: f64, days: f64) -> (f64, f64, f64, f64, bool, f64) {
+        let (s, r, q) = (self.spot(), self.r(), self.q());
+        let t = self.t_for_days(days);
+        if let Market::Chain { chain, .. } = self {
+            if let Some(exp) = self.expiry_for_days(days) {
+                if let Some(qt) = chain.find(exp, k, kind) {
+                    if qt.bid > 0.0 && qt.ask >= qt.bid {
+                        let iv = qt.iv.filter(|v| *v > 0.0).unwrap_or_else(|| self.iv_t(k, t));
+                        return (qt.mid(), qt.bid, qt.ask, iv, true, t);
+                    }
                 }
             }
         }
-        let iv = self.iv(k);
+        let iv = self.iv_t(k, t);
         let mid = bs_price(kind, s, k, t, r, q, iv);
         let hs = match self {
             Market::Synthetic(m) => (m.half_spread_pct * mid).max(0.05),
             _ => (0.02 * mid).max(0.05),
         };
-        (mid, (mid - hs).max(0.0), mid + hs, iv, false)
+        (mid, (mid - hs).max(0.0), mid + hs, iv, false, t)
+    }
+    /// Risk-neutral density of S at tenor `t` (Breeden–Litzenberger on the smile).
+    /// Returns (grid, density, step).
+    pub fn density(&self, t: f64) -> (Vec<f64>, Vec<f64>, f64) {
+        let (s, r, q) = (self.spot(), self.r(), self.q());
+        let t = t.max(1.0 / 365.0);
+        let df = (-r * t).exp();
+        let atm = self.iv_t(s * ((r - q) * t).exp(), t);
+        let sd = atm * t.sqrt();
+        let lo = (s * (-8.0 * sd - 0.5 * sd * sd).exp()).max(s * 0.005);
+        let hi = s * (8.0 * sd).exp();
+        let n = 3000;
+        let hk = (hi - lo) / n as f64;
+        let call_px = |k: f64| bs_price(OptionKind::Call, s, k, t, r, q, self.iv_t(k, t));
+        let mut xs = Vec::with_capacity(n + 1);
+        let mut qd = Vec::with_capacity(n + 1);
+        for i in 0..=n {
+            let k = lo + hk * i as f64;
+            let d2 = (call_px(k + hk) - 2.0 * call_px(k) + call_px((k - hk).max(1e-6))) / (hk * hk);
+            xs.push(k);
+            qd.push((d2 / df).max(0.0));
+        }
+        let mass: f64 = qd.iter().sum::<f64>() * hk;
+        if mass > 0.0 {
+            for v in &mut qd {
+                *v /= mass;
+            }
+        }
+        (xs, qd, hk)
     }
 }
 
@@ -1035,19 +1343,50 @@ pub struct PricedLeg {
     /// Cost when buying at ask / selling at bid.
     pub exec_value: f64,
     pub greeks: Greeks,
+    /// Years to this leg's expiry (cash pays / stock is unwound then).
+    #[serde(default)]
+    pub t: f64,
+}
+
+impl PricedLeg {
+    /// Value at time `elapsed` (years from now) when the underlying is `x`; options are
+    /// revalued with their pricing IV (sticky strike), expired legs pay intrinsic value.
+    pub fn value_at(&self, x: f64, elapsed: f64, r: f64, q: f64) -> f64 {
+        let rem = self.t - elapsed;
+        let l = self.leg;
+        l.qty
+            * match l.instrument {
+                Instrument::Cash => (-r * rem.max(0.0)).exp(),
+                Instrument::Stock => x * (-q * rem.max(0.0)).exp(),
+                Instrument::Call(k) => {
+                    if rem <= 1e-9 {
+                        (x - k).max(0.0)
+                    } else {
+                        bs_price(OptionKind::Call, x, k, rem, r, q, self.iv)
+                    }
+                }
+                Instrument::Put(k) => {
+                    if rem <= 1e-9 {
+                        (k - x).max(0.0)
+                    } else {
+                        bs_price(OptionKind::Put, x, k, rem, r, q, self.iv)
+                    }
+                }
+            }
+    }
 }
 
 /// Distribution of the payoff under one measure.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PayoffStats {
-    /// E[payoff].
+    /// E[value at the horizon].
     pub mean: f64,
-    /// P(payoff > cost grown at the risk-free rate) — the trade makes money.
+    /// P(value at the horizon > cost grown at the risk-free rate) — the trade makes money.
     pub prob_profit: f64,
     pub p05: f64,
     pub p50: f64,
     pub p95: f64,
-    /// Expected P&L = E[payoff] − cost·e^{rT}.
+    /// Expected P&L = E[value] − cost·e^{rH}.
     pub expected_pnl: f64,
 }
 
@@ -1056,6 +1395,7 @@ pub struct PayoffStats {
 pub struct PricedPayoff {
     pub legs: Vec<PricedLeg>,
     pub spot: f64,
+    /// Horizon in years: the earliest option expiry (= the expiry for single-expiry books).
     pub t: f64,
     pub r: f64,
     pub q: f64,
@@ -1065,9 +1405,10 @@ pub struct PricedPayoff {
     pub price_mid: f64,
     /// Price of ONE unit when crossing the spread.
     pub price_exec: f64,
-    /// Model fair value of the *target* function: e^{−rT} ∫ f(S) q(S) dS.
+    /// Model fair value of the *target* program: Σ over expiry groups of e^{−rT}∫f q dS.
     pub fair_target: f64,
-    /// Same for the replicated payoff (checks the density against the leg prices).
+    /// Discounted expectation of the replicated book's horizon value (checks the density
+    /// against the leg prices).
     pub fair_replicated: f64,
     /// Greeks of one unit (delta in shares, theta $/day, vega $/vol pt).
     pub greeks: Greeks,
@@ -1075,32 +1416,70 @@ pub struct PricedPayoff {
     pub real_world: PayoffStats,
     /// Annual drift assumed for the real-world measure.
     pub mu: f64,
-    /// Density grid (S, q_Q(S), q_P(S)) for plotting.
+    /// Density grid at the horizon (S, q_Q(S), q_P(S)) for plotting.
     pub density: Vec<(f64, f64, f64)>,
-    /// Break-evens of P&L at expiry (payoff = cost·e^{rT}).
+    /// Break-evens of P&L at the horizon (value = cost·e^{rH}).
     pub breakevens: Vec<f64>,
+    /// More than one expiry: later legs are still open at the horizon.
+    #[serde(default)]
+    pub multi_expiry: bool,
+    /// Horizon in calendar days.
+    #[serde(default)]
+    pub horizon_days: f64,
 }
 
-/// Price a replication. `mu` = real-world annual drift of the underlying (e.g. 0.08).
+impl PricedPayoff {
+    /// Value of one unit of the book at the horizon when S_H = `x` (expired legs at
+    /// intrinsic value, later legs at Black–Scholes value).
+    pub fn horizon_value(&self, x: f64) -> f64 {
+        self.legs.iter().map(|l| l.value_at(x, self.t, self.r, self.q)).sum()
+    }
+    /// Target at the horizon: the exact target payoff of the groups expiring at the horizon
+    /// plus the model value of the replicated legs that are still open.
+    pub fn horizon_target(&self, prog: &Program, rep: &Replication, x: f64) -> f64 {
+        if rep.groups.len() <= 1 {
+            return prog.eval(x, self.spot) + self.legs.iter().filter(|l| l.t > self.t + 1e-9).map(|l| l.value_at(x, self.t, self.r, self.q)).sum::<f64>();
+        }
+        let mut v = 0.0;
+        for g in &rep.groups {
+            let t_g = self.legs.iter().find(|l| l.leg.days == Some(g.days)).map_or(f64::NAN, |l| l.t);
+            if (t_g - self.t).abs() < 1e-9 {
+                v += g.expr.eval(Ctx { s: x, spot: self.spot });
+            } else if t_g.is_finite() {
+                v += self.legs.iter().filter(|l| l.leg.days == Some(g.days)).map(|l| l.value_at(x, self.t, self.r, self.q)).sum::<f64>();
+            }
+        }
+        v
+    }
+}
+
+/// Price a (single- or multi-expiry) replication. `mu` = real-world annual drift of the
+/// underlying (e.g. 0.08). Legs without `days` settle at the market's default expiry.
 pub fn price(prog: &Program, rep: &Replication, mkt: &Market, units: f64, mu: f64) -> PricedPayoff {
-    let (s, t, r, q) = (mkt.spot(), mkt.t(), mkt.r(), mkt.q());
-    let df = (-r * t).exp();
+    let (s, r, q) = (mkt.spot(), mkt.r(), mkt.q());
+    let default_days = mkt.default_days();
     let mut legs = Vec::new();
     let mut g = Greeks::default();
     let (mut pm, mut pe) = (0.0, 0.0);
     for leg in &rep.legs {
-        let (mid, bid, ask, iv, quoted, gk) = match leg.instrument {
-            Instrument::Cash => (df, df, df, 0.0, false, Greeks { price: df, rho: -t * df * 0.01, ..Default::default() }),
+        let days = leg.days.unwrap_or(default_days);
+        let (mid, bid, ask, iv, quoted, gk, t) = match leg.instrument {
+            Instrument::Cash => {
+                let t = mkt.t_for_days(days);
+                let df = (-r * t).exp();
+                (df, df, df, 0.0, false, Greeks { price: df, rho: -t * df * 0.01, ..Default::default() }, t)
+            }
             Instrument::Stock => {
+                let t = mkt.t_for_days(days);
                 let p = s * (-q * t).exp();
-                (p, p, p, 0.0, false, Greeks { price: p, delta: (-q * t).exp(), ..Default::default() })
+                (p, p, p, 0.0, false, Greeks { price: p, delta: (-q * t).exp(), ..Default::default() }, t)
             }
             Instrument::Call(k) | Instrument::Put(k) => {
                 let kind = if matches!(leg.instrument, Instrument::Call(_)) { OptionKind::Call } else { OptionKind::Put };
-                let (mid, bid, ask, iv, quoted) = mkt.option_quote(kind, k);
+                let (mid, bid, ask, iv, quoted, t) = mkt.option_quote_days(kind, k, days);
                 let mut gk = bs_greeks(kind, s, k, t, r, q, iv);
                 gk.price = mid;
-                (mid, bid, ask, iv, quoted, gk)
+                (mid, bid, ask, iv, quoted, gk, t)
             }
         };
         let value = leg.qty * mid;
@@ -1108,35 +1487,20 @@ pub fn price(prog: &Program, rep: &Replication, mkt: &Market, units: f64, mu: f6
         pm += value;
         pe += exec_value;
         g = g + gk * leg.qty;
-        legs.push(PricedLeg { leg: *leg, mid, bid, ask, iv, quoted, value, exec_value, greeks: gk * leg.qty });
+        legs.push(PricedLeg { leg: *leg, mid, bid, ask, iv, quoted, value, exec_value, greeks: gk * leg.qty, t });
     }
     g.price = pm;
+    // horizon = earliest option expiry (or earliest leg / default expiry)
+    let opt_t = legs.iter().filter(|l| l.leg.strike().is_some()).map(|l| l.t).fold(f64::INFINITY, f64::min);
+    let any_t = legs.iter().map(|l| l.t).fold(f64::INFINITY, f64::min);
+    let h = if opt_t.is_finite() { opt_t } else if any_t.is_finite() { any_t } else { mkt.t() };
+    let multi_expiry = legs.iter().any(|l| l.t > h + 1e-9 && l.leg.strike().is_some());
+    let df_h = (-r * h).exp();
 
-    // risk-neutral density from the smile (Breeden–Litzenberger on call prices)
-    let atm = mkt.iv(s * ((r - q) * t).exp());
-    let sd = atm * t.sqrt();
-    let lo = (s * (-8.0 * sd - 0.5 * sd * sd).exp()).max(s * 0.005);
-    let hi = s * (8.0 * sd).exp();
-    let n = 3000;
-    let hk = (hi - lo) / n as f64;
-    let call_px = |k: f64| bs_price(OptionKind::Call, s, k, t, r, q, mkt.iv(k));
-    let mut xs = Vec::with_capacity(n + 1);
-    let mut qd = Vec::with_capacity(n + 1);
-    for i in 0..=n {
-        let k = lo + hk * i as f64;
-        let d2 = (call_px(k + hk) - 2.0 * call_px(k) + call_px((k - hk).max(1e-6))) / (hk * hk);
-        xs.push(k);
-        qd.push((d2 / df).max(0.0));
-    }
-    let mass: f64 = qd.iter().sum::<f64>() * hk;
-    if mass > 0.0 {
-        for v in &mut qd {
-            *v /= mass;
-        }
-    }
-    // real-world: Esscher tilt q·(S/F)^θ so that E_P[S] = F·e^{(μ − (r − q))T}
-    let fwd = s * ((r - q) * t).exp();
-    let target_mean = fwd * ((mu - (r - q)) * t).exp();
+    let (xs, qd, hk) = mkt.density(h);
+    // real-world: Esscher tilt q·(S/F)^θ so that E_P[S] = F·e^{(μ − (r − q))H}
+    let fwd = s * ((r - q) * h).exp();
+    let target_mean = fwd * ((mu - (r - q)) * h).exp();
     let tilt = |th: f64| -> Vec<f64> {
         let mut p: Vec<f64> = xs.iter().zip(&qd).map(|(x, v)| v * (x / fwd).powf(th)).collect();
         let m: f64 = p.iter().sum::<f64>() * hk;
@@ -1159,16 +1523,49 @@ pub fn price(prog: &Program, rep: &Replication, mkt: &Market, units: f64, mu: f6
     }
     let pd = tilt(0.5 * (a + b));
 
-    let ft = |x: f64| prog.eval(x, s);
-    let fair_target = df * xs.iter().zip(&qd).map(|(x, v)| ft(*x) * v).sum::<f64>() * hk;
-    let fair_replicated = df * xs.iter().zip(&qd).map(|(x, v)| rep.payoff(*x) * v).sum::<f64>() * hk;
-    let cost_fv = pm / df;
+    let mut priced = PricedPayoff {
+        legs,
+        spot: s,
+        t: h,
+        r,
+        q,
+        units,
+        price_mid: pm,
+        price_exec: pe,
+        fair_target: 0.0,
+        fair_replicated: 0.0,
+        greeks: g,
+        risk_neutral: PayoffStats::default(),
+        real_world: PayoffStats::default(),
+        mu,
+        density: Vec::new(),
+        breakevens: Vec::new(),
+        multi_expiry,
+        horizon_days: (h * 365.0).round(),
+    };
+    let hv: Vec<f64> = xs.iter().map(|&x| priced.horizon_value(x)).collect();
+    // fair value of the target: each expiry group against the density at its own expiry
+    priced.fair_target = if rep.groups.len() > 1 {
+        rep.groups
+            .iter()
+            .map(|gr| {
+                let t_g = mkt.t_for_days(gr.days);
+                let (gx, gq, gh) = mkt.density(t_g);
+                (-r * t_g).exp() * gx.iter().zip(&gq).map(|(x, v)| gr.expr.eval(Ctx { s: *x, spot: s }) * v).sum::<f64>() * gh
+            })
+            .sum()
+    } else {
+        // single expiry (+ possibly nothing else): target at the horizon
+        df_h * xs.iter().zip(&qd).map(|(x, v)| prog.eval(*x, s) * v).sum::<f64>() * hk
+    };
+    priced.fair_replicated = df_h * hv.iter().zip(&qd).map(|(v, w)| v * w).sum::<f64>() * hk;
+    let cost_fv = pm / df_h;
     let stats = |p: &[f64]| -> PayoffStats {
-        let mut pts: Vec<(f64, f64)> = xs.iter().zip(p).map(|(x, w)| (rep.payoff(*x), w * hk)).collect();
+        let mut pts: Vec<(f64, f64)> = hv.iter().zip(p).map(|(v, w)| (*v, w * hk)).collect();
         let mean: f64 = pts.iter().map(|(v, w)| v * w).sum();
         let prob_profit: f64 = pts.iter().filter(|(v, _)| *v > cost_fv + 1e-9).map(|(_, w)| w).sum();
         pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        let q = |p: f64| {
+        let qf = |p: f64| {
             let mut acc = 0.0;
             for (v, w) in &pts {
                 acc += w;
@@ -1178,54 +1575,35 @@ pub fn price(prog: &Program, rep: &Replication, mkt: &Market, units: f64, mu: f6
             }
             pts.last().map_or(0.0, |x| x.0)
         };
-        PayoffStats { mean, prob_profit, p05: q(0.05), p50: q(0.5), p95: q(0.95), expected_pnl: mean - cost_fv }
+        PayoffStats { mean, prob_profit, p05: qf(0.05), p50: qf(0.5), p95: qf(0.95), expected_pnl: mean - cost_fv }
     };
-    let risk_neutral = stats(&qd);
-    let real_world = stats(&pd);
-    // break-evens of P&L at expiry over a wide range
-    let mut breakevens = Vec::new();
-    let bl = s * 0.05;
-    let bh = s * 3.0;
-    let nb = 3000;
-    let pnl = |x: f64| rep.payoff(x) - cost_fv;
+    priced.risk_neutral = stats(&qd);
+    priced.real_world = stats(&pd);
+    // break-evens of horizon P&L over a wide range
+    let (bl, bh, nb) = (s * 0.05, s * 3.0, 3000);
+    let pnl = |x: f64| priced.horizon_value(x) - cost_fv;
     let mut prev = pnl(bl);
+    let mut bes = Vec::new();
     for i in 1..=nb {
         let x = bl + (bh - bl) * i as f64 / nb as f64;
         let v = pnl(x);
         if prev.signum() != v.signum() && v != 0.0 {
             let x0 = x - (bh - bl) / nb as f64;
-            breakevens.push(x0 + (x - x0) * prev.abs() / (prev.abs() + v.abs()));
+            bes.push(x0 + (x - x0) * prev.abs() / (prev.abs() + v.abs()));
         }
         prev = v;
     }
-    let density = xs.iter().zip(qd.iter().zip(&pd)).step_by(10).map(|(x, (a, b))| (*x, *a, *b)).collect();
-    PricedPayoff { legs, spot: s, t, r, q, units, price_mid: pm, price_exec: pe, fair_target, fair_replicated, greeks: g, risk_neutral, real_world, mu, density, breakevens }
+    priced.breakevens = bes;
+    priced.density = xs.iter().zip(qd.iter().zip(&pd)).step_by(10).map(|(x, (a, b))| (*x, *a, *b)).collect();
+    priced
 }
 
-/// Value of the replicating portfolio before expiry, as a function of the spot, with
-/// `t_remaining` years left and each option at its pricing IV (sticky strike).
+/// Value of the book as a function of the spot when `t_remaining` years are left until the
+/// horizon (`t_remaining = priced.t` → today, `0` → at the horizon). Each option keeps its
+/// pricing IV (sticky strike); legs that have expired pay intrinsic value.
 pub fn value_curve(priced: &PricedPayoff, spots: &[f64], t_remaining: f64) -> Vec<(f64, f64)> {
-    let (r, q) = (priced.r, priced.q);
-    spots
-        .iter()
-        .map(|&x| {
-            let v: f64 = priced
-                .legs
-                .iter()
-                .map(|pl| {
-                    let l = pl.leg;
-                    l.qty
-                        * match l.instrument {
-                            Instrument::Cash => (-r * t_remaining).exp(),
-                            Instrument::Stock => x * (-q * t_remaining).exp(),
-                            Instrument::Call(k) => bs_price(OptionKind::Call, x, k, t_remaining, r, q, pl.iv),
-                            Instrument::Put(k) => bs_price(OptionKind::Put, x, k, t_remaining, r, q, pl.iv),
-                        }
-                })
-                .sum();
-            (x, v)
-        })
-        .collect()
+    let elapsed = (priced.t - t_remaining).max(0.0);
+    spots.iter().map(|&x| (x, priced.legs.iter().map(|l| l.value_at(x, elapsed, priced.r, priced.q)).sum())).collect()
 }
 
 /// Built-in example programs (name, source, Chinese explanation).
@@ -1243,6 +1621,11 @@ pub fn examples() -> Vec<(&'static str, &'static str, &'static str)> {
         ("平滑凸函數", "(S/spot)^2 * spot / 2", "非線性：二次曲線，以履約價網格近似（方差交換的核心）。"),
         ("對數報酬", "spot * ln(max(S, 1) / spot)", "對數合約：波動率交換的複製核心；只能近似。"),
         ("變數與組合", "k = 100%\nw = 10%\nbutterfly(k - w, k, k + w) * 10", "可以定義變數：在 ±10% 範圍內的蝶式，押價格停在現價附近。"),
+        ("PMCC（跨到期）", "call(80%) @ 540 - call(105%) @ 45", "窮人備兌：買 18 個月深價內 LEAPS，每月賣 105% 買權收時間價值；圖為 45 天後的價值。"),
+        ("日曆價差（跨到期）", "call(100%) @ 90 - call(100%) @ 30", "賣近月、買遠月同履約價：押 30 天內價格停在現價附近、遠月 IV 不跌。"),
+        ("賣權對角（跨到期）", "put(95%) @ 120 - put(90%) @ 30", "看跌保護的對角價差：近月賣權資助遠月保護。"),
+        ("LEAPS + 短期避險", "call(80%) @ 1y + put(95%) @ 60", "長天期槓桿多頭，加 60 天賣權暫時封住下跌（例如財報/事件前）。"),
+        ("雙日曆（跨到期）", "strangle(95%, 105%) @ 60 - strangle(95%, 105%) @ 30", "雙日曆：在 ±5% 兩個履約價各做日曆，押區間盤整。"),
     ]
 }
 
@@ -1415,4 +1798,112 @@ mod tests {
         assert!(px.legs.iter().filter(|l| l.leg.strike().is_some()).all(|l| l.quoted));
         assert!(px.price_mid > 0.0 && px.price_mid < 50.0);
     }
+    #[test]
+    fn expiry_tags_parse_and_group() {
+        let pr = p("call(80%) @ 540 - call(105%) @ 45");
+        assert!(pr.is_multi_expiry());
+        let g = pr.expiry_groups(365.0).unwrap();
+        assert_eq!(g.iter().map(|x| x.0).collect::<Vec<_>>(), vec![45.0, 540.0]);
+        assert_eq!(g[0].1.eval(Ctx { s: 700.0, spot: 600.0 }), -(700.0 - 630.0));
+        // units and untagged default
+        let g = p("call(100%) @ 6m + put(90%) @ 1y + 3").expiry_groups(30.0).unwrap();
+        assert_eq!(g.iter().map(|x| x.0).collect::<Vec<_>>(), vec![30.0, 183.0, 365.0]);
+        let g = p("2 * (call(600) - call(650)) @ 2w").expiry_groups(30.0).unwrap();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].0, 14.0);
+        assert_eq!(g[0].1.eval(Ctx { s: 700.0, spot: 600.0 }), 100.0);
+        // same expiry tagged twice merges
+        assert_eq!(p("call(600) @ 30 + put(550) @ 30d").expiry_groups(90.0).unwrap().len(), 1);
+        // non-linear across expiries is rejected, nested conflicts too
+        assert!(p("max(call(600) @ 30, call(600) @ 90)").expiry_groups(30.0).is_err());
+        assert!(p("call(600) @ 30 * call(600) @ 90").expiry_groups(30.0).is_err());
+        assert!(p("(call(600) @ 30) @ 90").expiry_groups(30.0).is_err());
+        assert!(parse("call(600) @ 0").is_err());
+        assert!(parse("call(600) @").is_err());
+        // single-expiry eval ignores tags
+        assert_eq!(p("call(600) @ 30").eval(610.0, 600.0), 10.0);
+    }
+
+    #[test]
+    fn compile_book_single_expiry_matches_compile() {
+        let pr = p("collar(90%, 115%)");
+        let a = compile(&pr, &CompileOptions::free(600.0)).unwrap();
+        let b = compile_book(&pr, 365.0, &|_| CompileOptions::free(600.0)).unwrap();
+        assert_eq!(a.legs.len(), b.legs.len());
+        for (x, y) in a.legs.iter().zip(&b.legs) {
+            assert_eq!(x.instrument, y.instrument);
+            assert!((x.qty - y.qty).abs() < 1e-12);
+            assert_eq!(y.days, Some(365.0));
+        }
+        let mkt = Market::Synthetic(SyntheticMarket::new(600.0, 1.0, 0.04, 0.01, 0.2));
+        let pa = price(&pr, &a, &mkt, 100.0, 0.08);
+        let pb = price(&pr, &b, &mkt, 100.0, 0.08);
+        assert!((pa.price_mid - pb.price_mid).abs() < 1e-9);
+        assert!((pa.risk_neutral.mean - pb.risk_neutral.mean).abs() < 1e-9);
+        assert!(!pb.multi_expiry);
+    }
+
+    #[test]
+    fn calendar_spread_prices_and_horizon_value() {
+        let flat = SyntheticMarket { skew: 0.0, curv: 0.0, ..SyntheticMarket::new(600.0, 30.0 / 365.0, 0.04, 0.01, 0.2) };
+        let mkt = Market::Synthetic(flat);
+        let pr = p("call(600) @ 90 - call(600) @ 30");
+        let rep = compile_book(&pr, 30.0, &|_| CompileOptions::free(600.0)).unwrap();
+        assert_eq!(rep.groups.len(), 2);
+        let px = price(&pr, &rep, &mkt, 100.0, 0.08);
+        let (t1, t2) = (30.0 / 365.0, 90.0 / 365.0);
+        let want = bs_price(OptionKind::Call, 600.0, 600.0, t2, 0.04, 0.01, 0.2) - bs_price(OptionKind::Call, 600.0, 600.0, t1, 0.04, 0.01, 0.2);
+        assert!((px.price_mid - want).abs() < 1e-9, "{} vs {want}", px.price_mid);
+        assert!(px.multi_expiry);
+        assert!((px.t - t1).abs() < 1e-12);
+        assert_eq!(px.horizon_days, 30.0);
+        // at the horizon the calendar is worth most near the strike, less in the tails
+        let at_k = px.horizon_value(600.0);
+        assert!(at_k > px.horizon_value(500.0) && at_k > px.horizon_value(720.0));
+        assert!((at_k - bs_price(OptionKind::Call, 600.0, 600.0, t2 - t1, 0.04, 0.01, 0.2)).abs() < 1e-9);
+        // today's value curve at spot = price; target at horizon = replicated (exact legs)
+        let now = value_curve(&px, &[600.0], px.t)[0].1;
+        assert!((now - px.price_mid).abs() < 1e-9);
+        for x in [520.0, 600.0, 690.0] {
+            assert!((px.horizon_target(&pr, &rep, x) - px.horizon_value(x)).abs() < 1e-9);
+        }
+        // fair value of the target book under the model ≈ price (density integration)
+        assert!((px.fair_target - px.price_mid).abs() < 0.05, "{} vs {}", px.fair_target, px.price_mid);
+        // a long calendar is short gamma / long vega at inception
+        assert!(px.greeks.vega > 0.0 && px.greeks.gamma < 0.0);
+    }
+
+    #[test]
+    fn term_structure_interpolates_total_variance() {
+        let m = SyntheticMarket { long_iv: 0.25, long_t: 2.0, ..SyntheticMarket::new(600.0, 0.25, 0.04, 0.0, 0.18) };
+        assert!((m.atm_t(0.1) - 0.18).abs() < 1e-12);
+        assert!((m.atm_t(0.25) - 0.18).abs() < 1e-12);
+        assert!((m.atm_t(3.0) - 0.25).abs() < 1e-12);
+        let mid = m.atm_t(1.0);
+        assert!(mid > 0.18 && mid < 0.25);
+        let w = 0.18f64.powi(2) * 0.25 + (1.0 - 0.25) / 1.75 * (0.25f64.powi(2) * 2.0 - 0.18f64.powi(2) * 0.25);
+        assert!((mid - (w / 1.0).sqrt()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn multi_expiry_examples_compile_and_price() {
+        let mkt = Market::Synthetic(SynthLike::mkt());
+        for (name, src, _) in examples() {
+            let pr = parse(src).unwrap();
+            let rep = compile_book(&pr, 365.0, &|_| CompileOptions::free(600.0)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let px = price(&pr, &rep, &mkt, 100.0, 0.08);
+            assert!(px.price_mid.is_finite() && px.risk_neutral.mean.is_finite(), "{name}");
+            if pr.is_multi_expiry() {
+                assert!(px.multi_expiry || rep.groups.len() > 1, "{name}");
+            }
+        }
+    }
+
+    struct SynthLike;
+    impl SynthLike {
+        fn mkt() -> SyntheticMarket {
+            SyntheticMarket { long_iv: 0.24, ..SyntheticMarket::new(600.0, 1.0, 0.04, 0.006, 0.22) }
+        }
+    }
+
 }
