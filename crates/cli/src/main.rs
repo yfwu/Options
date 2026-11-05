@@ -227,6 +227,61 @@ enum Cmd {
         #[arg(long)]
         strategy: Option<String>,
     },
+    /// Payoff compiler: write f(S), get the replicating options portfolio, its price and distribution.
+    ///
+    /// Examples: `optlab payoff "S + put(95%)"`, `optlab payoff "2*bull(100%,115%)" --symbol QQQ`,
+    /// `optlab payoff "pwl(80%,-10, 100%,0, 120%,40)" --chain-file snap.json --days 365`.
+    /// Run `optlab payoff --examples` for the language reference.
+    Payoff {
+        /// Payoff program (use `;` or new lines between statements). Omit with --examples.
+        expr: Option<String>,
+        /// Read the program from a file instead.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Print example programs and the language reference.
+        #[arg(long)]
+        examples: bool,
+        /// Underlying for spot / IV defaults (bundled history: latest close and vol index).
+        #[arg(long, default_value = "QQQ")]
+        symbol: String,
+        /// Override spot.
+        #[arg(long)]
+        spot: Option<f64>,
+        /// Override ATM implied vol (decimal).
+        #[arg(long)]
+        iv: Option<f64>,
+        /// Calendar days to expiry.
+        #[arg(long, default_value_t = 365)]
+        days: i64,
+        #[arg(long)]
+        rate: Option<f64>,
+        #[arg(long)]
+        div: Option<f64>,
+        /// Put skew of the synthetic smile (0 = Black–Scholes flat vol).
+        #[arg(long, default_value_t = 0.30)]
+        skew: f64,
+        /// Units of the function to buy (100 = 1 contract per unit of option quantity).
+        #[arg(long, default_value_t = 100.0)]
+        units: f64,
+        /// Real-world annual drift for the P-measure statistics.
+        #[arg(long, default_value_t = 0.08)]
+        mu: f64,
+        /// otm (puts below spot, calls above) | calls | puts
+        #[arg(long, default_value = "otm")]
+        style: String,
+        /// Strike step for free-grid compilation (default: by price level).
+        #[arg(long)]
+        step: Option<f64>,
+        /// Price on a real chain: an OptLab snapshot or CBOE delayed-quotes JSON file…
+        #[arg(long)]
+        chain_file: Option<std::path::PathBuf>,
+        /// …or fetch one live (cboe | yahoo | tradier | polygon | auto | snapshot).
+        #[arg(long)]
+        provider: Option<String>,
+        /// Write S, target f(S), replicated g(S) and today's value to CSV.
+        #[arg(long)]
+        csv: Option<std::path::PathBuf>,
+    },
     /// List strategy templates, or analyse one on a synthetic market.
     Strategies {
         /// Template key (leaps, pmcc, bull_call_spread, ...). Omit to list.
@@ -575,6 +630,9 @@ fn main() -> Result<()> {
                 print_strategy(&s, &MarketParams::new(chain.spot, r, q), a.surface.iv(chain.spot, 1.0).unwrap_or(0.2));
             }
         }
+        Cmd::Payoff { expr, file, examples, symbol, spot, iv, days, rate, div, skew, units, mu, style, step, chain_file, provider, csv } => {
+            run_payoff(PayoffArgs { expr, file, examples, symbol, spot, iv, days, rate, div, skew, units, mu, style, step, chain_file, provider, csv })?;
+        }
         Cmd::Strategies { template, spot, iv, rate, div } => match template {
             None => {
                 for t in ALL_TEMPLATES {
@@ -616,4 +674,158 @@ fn print_strategy(s: &optlab_core::strategy::Strategy, p: &MarketParams, sigma: 
     );
     let g = s.greeks(p.spot, s.created, p);
     println!("  Greeks（部位）：Δ {:.1} 股  Γ {:.3}  Θ ${:.2}/天  Vega ${:.2}/vol點", g.delta, g.gamma, g.theta, g.vega);
+}
+
+struct PayoffArgs {
+    expr: Option<String>,
+    file: Option<std::path::PathBuf>,
+    examples: bool,
+    symbol: String,
+    spot: Option<f64>,
+    iv: Option<f64>,
+    days: i64,
+    rate: Option<f64>,
+    div: Option<f64>,
+    skew: f64,
+    units: f64,
+    mu: f64,
+    style: String,
+    step: Option<f64>,
+    chain_file: Option<std::path::PathBuf>,
+    provider: Option<String>,
+    csv: Option<std::path::PathBuf>,
+}
+
+fn run_payoff(a: PayoffArgs) -> Result<()> {
+    use optlab_core::payoff::{compile, examples, parse, price, value_curve, CompileOptions, Instrument, LegStyle, Market, StrikeGrid, SyntheticMarket};
+    if a.examples {
+        println!("Payoff 語言：S = 到期價格，spot = 現價，110% = 1.10×spot；+ - * / ^；變數 a = 600；以 ; 或換行分隔");
+        println!("基本元件：call(K) put(K) digital(K) digitalput(K) pwl(x1,y1,x2,y2,…)");
+        println!("巨集：straddle(K) strangle(Kp,Kc) bull(K1,K2) bear(K1,K2) butterfly(K1,K2,K3) condor(K1..K4) collar(Kp,Kc) protect(K)");
+        println!("函數：max min abs pos neg clamp(x,lo,hi) sqrt ln exp\n");
+        for (name, src, note) in examples() {
+            println!("■ {name}\n  {}\n  {note}\n", src.replace('\n', "; "));
+        }
+        return Ok(());
+    }
+    let src = match (&a.expr, &a.file) {
+        (_, Some(p)) => std::fs::read_to_string(p)?,
+        (Some(e), None) => e.clone(),
+        (None, None) => bail!("請提供 payoff 運算式（或 --examples 查看範例）"),
+    };
+    let prog = parse(&src)?;
+    let style = match a.style.as_str() {
+        "calls" => LegStyle::AllCalls,
+        "puts" => LegStyle::AllPuts,
+        _ => LegStyle::OutOfTheMoney,
+    };
+    // market
+    let chain = if let Some(p) = &a.chain_file {
+        let txt = std::fs::read_to_string(p)?;
+        Some(serde_json::from_str::<optlab_core::OptionChain>(&txt).or_else(|_| optlab_data::providers::cboe::parse_chain(&txt, &a.symbol))?)
+    } else if let Some(pv) = &a.provider {
+        let svc = DataService::load_default()?;
+        Some(match pv.as_str() {
+            "auto" => svc.fetch_chain_auto(&a.symbol)?,
+            "snapshot" => svc.latest_snapshot(&a.symbol)?.context("沒有本地快照")?,
+            other => svc.fetch_chain(other.parse::<Provider>().map_err(|e| anyhow::anyhow!("{e}"))?, &a.symbol)?,
+        })
+    } else {
+        None
+    };
+    let r = a.rate.unwrap_or_else(|| match presets::rate_source() {
+        optlab_core::backtest::RateSource::Series(s) => s.last().map_or(0.04, |x| x.1 / 100.0),
+        optlab_core::backtest::RateSource::Constant(c) => c,
+    });
+    let (mkt, spot) = if let Some(ch) = chain {
+        let q = a.div.unwrap_or_else(|| presets::default_dividend_yield(&ch.underlying));
+        let exp = ch.expiry_near_dte(a.days).context("期權鏈沒有可用到期日")?;
+        println!("期權鏈：{} {} 現價 {:.2}，到期日 {}（{} 天），來源 {}", ch.underlying, ch.as_of, ch.spot, exp, (exp - ch.as_of_date()).num_days(), ch.source);
+        let s = ch.spot;
+        (Market::chain(ch, exp, r, q), s)
+    } else {
+        let px = bundled::prices(&a.symbol);
+        let s = a.spot.or_else(|| px.as_ref().and_then(|p| p.bars.last().map(|b| b.close))).context("請用 --spot 指定現價")?;
+        let iv = a.iv.unwrap_or_else(|| {
+            bundled::default_vol_index_for(&a.symbol)
+                .and_then(|v| v.last())
+                .map(|(_, v)| presets::vol_model_for(&a.symbol).atm_vol(a.days as f64 / 365.0, v))
+                .unwrap_or(0.2)
+        });
+        let q = a.div.unwrap_or_else(|| presets::default_dividend_yield(&a.symbol));
+        println!("合成市場：{} 現價 {s:.2}  ATM IV {:.1}%  偏斜 {:.2}  r {:.2}%  q {:.2}%  {} 天", a.symbol, iv * 100.0, a.skew, r * 100.0, q * 100.0, a.days);
+        let m = SyntheticMarket { skew: a.skew, ..SyntheticMarket::new(s, a.days.max(1) as f64 / 365.0, r, q, iv) };
+        (Market::Synthetic(m), s)
+    };
+    let mut opt = match mkt.listed_strikes() {
+        Some(ks) => CompileOptions::listed(spot, ks),
+        None => CompileOptions::free(spot),
+    };
+    if let (Some(st), StrikeGrid::Free { .. }) = (a.step, &opt.grid) {
+        opt.grid = StrikeGrid::Free { step: st };
+    }
+    opt.style = style;
+    let rep = compile(&prog, &opt)?;
+    let px = price(&prog, &rep, &mkt, a.units, a.mu);
+
+    println!("\n編譯結果  f(S) ≈ {}", rep.formula());
+    println!("複製誤差：最大 {:.4}  平均 {:.4}（區間 {:.0}–{:.0}）{}", rep.max_error, rep.mean_error, spot * 0.5, spot * 1.6, if rep.approximated { "  [近似]" } else { "  [精確]" });
+    for w in &rep.warnings {
+        println!("  ⚠ {w}");
+    }
+    println!("\n{:<14} {:>10} {:>10} {:>10} {:>10} {:>8} {:>12}   (× {} 單位 = 口數 {})", "工具", "數量/單位", "中價", "買/賣價", "成交價值", "IV", "部位價值", a.units, a.units / 100.0);
+    for l in &px.legs {
+        let name = match l.leg.instrument {
+            Instrument::Cash => "零息債/現金".to_string(),
+            Instrument::Stock => "股票".to_string(),
+            Instrument::Call(k) => format!("Call {k:.2}"),
+            Instrument::Put(k) => format!("Put {k:.2}"),
+        };
+        let side = if l.leg.qty >= 0.0 { l.ask } else { l.bid };
+        println!(
+            "{:<14} {:>10.4} {:>10.3} {:>10.3} {:>10.3} {:>7} {:>12.2}{}",
+            name,
+            l.leg.qty,
+            l.mid,
+            side,
+            l.exec_value,
+            if l.iv > 0.0 { format!("{:.1}%", l.iv * 100.0) } else { "-".into() },
+            l.value * a.units,
+            if l.leg.strike().is_some() && !l.quoted { "  (模型價)" } else { "" }
+        );
+    }
+    println!(
+        "\n函數價格（每單位）：中價 {:.3}  可成交 {:.3}（價差成本 {:.3}）  ×{} 單位 = ${:.0}",
+        px.price_mid,
+        px.price_exec,
+        px.price_exec - px.price_mid,
+        a.units,
+        px.price_exec * a.units
+    );
+    println!("模型公允值：目標函數 {:.3}  複製組合 {:.3}（風險中性密度積分）", px.fair_target, px.fair_replicated);
+    println!(
+        "Greeks（每單位）：Δ {:.3}  Γ {:.5}  Θ {:.4}/天  Vega {:.4}/vol點    （×{}：Δ {:.1} 股）",
+        px.greeks.delta, px.greeks.gamma, px.greeks.theta, px.greeks.vega, a.units, px.greeks.delta * a.units
+    );
+    for (name, st) in [("風險中性 Q", &px.risk_neutral), (&*format!("真實世界 P (μ={:.0}%)", px.mu * 100.0), &px.real_world)] {
+        println!(
+            "{:<20} 期望收益 {:>9.3}  期望損益 {:>8.3}  獲利機率 {:>5.1}%  收益 P5/P50/P95 {:.2} / {:.2} / {:.2}",
+            name, st.mean, st.expected_pnl, st.prob_profit * 100.0, st.p05, st.p50, st.p95
+        );
+    }
+    if !px.breakevens.is_empty() {
+        println!("到期損益兩平：{:?}", px.breakevens.iter().map(|b| (b * 100.0).round() / 100.0).collect::<Vec<_>>());
+    }
+    if let Some(p) = a.csv {
+        let n = 240;
+        let spots: Vec<f64> = (0..=n).map(|i| spot * (0.4 + 1.4 * i as f64 / n as f64)).collect();
+        let now = value_curve(&px, &spots, px.t);
+        let mut out = String::from("S,target,replicated,value_now\n");
+        for (i, s) in spots.iter().enumerate() {
+            out.push_str(&format!("{s:.4},{:.6},{:.6},{:.6}\n", prog.eval(*s, spot), rep.payoff(*s), now[i].1));
+        }
+        std::fs::write(&p, out)?;
+        println!("已寫出 {}", p.display());
+    }
+    Ok(())
 }

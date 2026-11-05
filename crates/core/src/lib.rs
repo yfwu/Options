@@ -5,6 +5,7 @@
 
 pub mod chain;
 pub mod history;
+pub mod payoff;
 pub mod pricing;
 pub mod strategy;
 pub mod surface;
