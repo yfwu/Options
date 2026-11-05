@@ -66,6 +66,18 @@ struct RollArgs {
     /// Use the conservative cost model (wider spreads, slippage, stronger crisis widening).
     #[arg(long)]
     conservative: bool,
+    /// Risk overlay: cap exposure when strategy drawdown exceeds this (0.30 = −30%).
+    #[arg(long)]
+    dd_trigger: Option<f64>,
+    /// Exposure cap while the drawdown rule is active.
+    #[arg(long, default_value_t = 1.0)]
+    dd_exposure: f64,
+    /// Risk overlay: trend filter moving-average length (e.g. 200).
+    #[arg(long)]
+    sma: Option<usize>,
+    /// Exposure cap while the underlying is below its moving average (0 = cash).
+    #[arg(long, default_value_t = 1.0)]
+    sma_exposure: f64,
     /// Start date YYYY-MM-DD.
     #[arg(long)]
     start: Option<NaiveDate>,
@@ -98,6 +110,10 @@ impl RollArgs {
         if self.conservative {
             c.costs = optlab_core::synth::CostModel::conservative();
         }
+        c.risk.dd_trigger = self.dd_trigger;
+        c.risk.dd_exposure = self.dd_exposure;
+        c.risk.trend_sma = self.sma;
+        c.risk.trend_exposure = self.sma_exposure;
         c.initial_capital = self.capital;
         c.integer_contracts = self.integer;
         c.start = self.start;
@@ -267,7 +283,7 @@ fn print_result(r: &BacktestResult) {
         r.cost_drag_annual * 100.0,
         r.avg_exposure,
         r.avg_carry_pct_of_exposure * 100.0,
-        pct(r.min_equity_ratio),
+        if r.config.risk.is_active() { format!("{}（風險規則限制 {} 的交易日）", pct(r.min_equity_ratio), pct(r.risk_capped_pct)) } else { pct(r.min_equity_ratio) },
         if r.wiped_out {
             format!("  ⚠ 爆倉 {}", r.wiped_date.map(|d| d.to_string()).unwrap_or_default())
         } else if r.near_wipe {

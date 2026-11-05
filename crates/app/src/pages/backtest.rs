@@ -54,6 +54,10 @@ struct Inputs {
     exec_lag: Entity<InputState>,
     crisis_ref: Entity<InputState>,
     crisis_exp: Entity<InputState>,
+    dd_trigger: Entity<InputState>,
+    dd_exposure: Entity<InputState>,
+    sma: Entity<InputState>,
+    sma_exposure: Entity<InputState>,
 }
 
 pub struct BacktestPage {
@@ -120,6 +124,10 @@ impl BacktestPage {
             exec_lag: i(cfg.exec_lag_days.to_string(), window, cx),
             crisis_ref: i(format!("{}", cfg.costs.crisis_ref_vol), window, cx),
             crisis_exp: i(format!("{}", cfg.costs.crisis_exp), window, cx),
+            dd_trigger: new_input_ph("", "例 30 (%)，空白=不用", window, cx),
+            dd_exposure: i("1.0".into(), window, cx),
+            sma: new_input_ph("", "例 200，空白=不用", window, cx),
+            sma_exposure: i("0".into(), window, cx),
         };
         let subs = vec![cx.subscribe_in(&symbol, window, |this, _, ev: &SelectEvent<Vec<SharedString>>, window, cx| {
             let SelectEvent::Confirm(Some(v)) = ev else { return };
@@ -202,6 +210,10 @@ impl BacktestPage {
             set(&self.inp.exec_lag, c.exec_lag_days.to_string(), window, cx);
             set(&self.inp.crisis_ref, format!("{}", c.costs.crisis_ref_vol), window, cx);
             set(&self.inp.crisis_exp, format!("{}", c.costs.crisis_exp), window, cx);
+            set(&self.inp.dd_trigger, opt_str(c.risk.dd_trigger, 100.0), window, cx);
+            set(&self.inp.dd_exposure, format!("{}", c.risk.dd_exposure), window, cx);
+            set(&self.inp.sma, c.risk.trend_sma.map(|n| n.to_string()).unwrap_or_default(), window, cx);
+            set(&self.inp.sma_exposure, format!("{}", c.risk.trend_exposure), window, cx);
             self.integer = c.integer_contracts;
             self.cash_yield = c.cash_yield;
         }
@@ -256,6 +268,10 @@ impl BacktestPage {
         cfg.exec_lag_days = e.int("exec_lag", &i.exec_lag, 0, 20, cx) as u32;
         cfg.costs.crisis_ref_vol = e.num_range("crisis_ref", &i.crisis_ref, 0.0, 200.0, cx);
         cfg.costs.crisis_exp = e.num_range("crisis_exp", &i.crisis_exp, 0.0, 5.0, cx);
+        cfg.risk.dd_trigger = opt(&mut e, "dd_trigger", &i.dd_trigger, 1.0, 99.0, 100.0);
+        cfg.risk.dd_exposure = e.num_range("dd_exposure", &i.dd_exposure, 0.0, 10.0, cx);
+        cfg.risk.trend_sma = opt(&mut e, "sma", &i.sma, 2.0, 1000.0, 1.0).map(|n| n.round() as usize);
+        cfg.risk.trend_exposure = e.num_range("sma_exposure", &i.sma_exposure, 0.0, 10.0, cx);
         cfg.integer_contracts = self.integer;
         cfg.cash_yield = self.cash_yield;
         if let (Some(a), Some(b)) = (cfg.start, cfg.end) {
@@ -419,6 +435,9 @@ impl BacktestPage {
             .child(row().child(f("槓桿ETF 借貸利差 %", "lev_spread", &i.lev_spread)).child(f("槓桿ETF 費用率 %", "lev_er", &i.lev_er)))
             .child(section_title("進階 Advanced", cx))
             .child(row().child(f("執行延遲 (交易日)", "exec_lag", &i.exec_lag)).child(f("危機價差門檻", "crisis_ref", &i.crisis_ref)).child(f("危機價差指數", "crisis_exp", &i.crisis_exp)))
+            .child(section_title("風險規則 Risk overlay", cx))
+            .child(row().child(f("回撤觸發 %", "dd_trigger", &i.dd_trigger)).child(f("觸發後曝險上限 x", "dd_exposure", &i.dd_exposure)))
+            .child(row().child(f("趨勢均線 (日)", "sma", &i.sma)).child(f("跌破均線曝險上限 x (0=現金)", "sma_exposure", &i.sma_exposure)))
             .child(
                 Button::new("run-bt")
                     .primary()
@@ -428,6 +447,7 @@ impl BacktestPage {
                     .on_click(cx.listener(|this, _, window, cx| this.run(window, cx))),
             )
             .when(!self.errors.is_empty(), |d| d.child(div().text_size(px(11.0)).text_color(palette().red).child(self.errors.summary())))
+            .child(muted_text("風險規則：權益自高點回撤超過門檻、或標的跌破均線（±2% 緩衝）時，把目標曝險壓到上限；回測顯示可大幅降低 2000/2008 型尾部風險，但震盪市會來回停損、拔靴中位報酬約低 2%/年——是保險不是 alpha。", cx))
             .child(muted_text("危機價差：波動率指數高於門檻 (0 = 關閉) 時，半價差 × (vol/門檻)^指數。執行延遲 1 = 收盤看到訊號、次日收盤成交。", cx))
             .child(muted_text(
                 "說明：以內建歷史價格 + 波動率指數 (VXN/VIX) 驅動的偏斜 IV 曲面合成 LEAPS 價格；利率使用 3M 國庫券歷史。基準：買進持有與每日再平衡 L 倍槓桿 ETF。",
@@ -585,6 +605,7 @@ impl BacktestPage {
                 .child(kv("平均無風險利率", pct2(res.avg_rate), cx))
                 .child(kv("參數 / 結果", res.label(), cx))
                 .child(kv_colored("最低權益 / 初始", pct(res.min_equity_ratio), if res.near_wipe { p.red } else { p.text }, cx))
+                .when(res.config.risk.is_active(), |d| d.child(kv_colored("風險規則限制天數", pct(res.risk_capped_pct), p.text, cx)))
                 .when(res.near_wipe && !res.wiped_out, |d| d.child(badge(format!("⚠ 近乎歸零：最低權益僅剩初始的 {}", pct(res.min_equity_ratio)), p.red)))
                 .when(res.wiped_out, |d| {
                     d.child(badge(format!("⚠ 帳戶歸零於 {}", res.wiped_date.map(|d| d.to_string()).unwrap_or_default()), p.red))

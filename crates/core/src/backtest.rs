@@ -177,6 +177,9 @@ pub struct RollConfig {
     pub exec_lag_days: u32,
     /// "Near wipe-out" threshold on the minimum equity / initial capital (default 0.10).
     pub near_wipe_level: f64,
+    /// Risk overlay that lowers the exposure cap in drawdowns / downtrends (off by default).
+    #[serde(default)]
+    pub risk: RiskOverlay,
     pub start: Option<NaiveDate>,
     pub end: Option<NaiveDate>,
 }
@@ -206,9 +209,76 @@ impl Default for RollConfig {
             lev_expense_ratio: 0.0095,
             exec_lag_days: 1,
             near_wipe_level: 0.10,
+            risk: RiskOverlay::default(),
             start: None,
             end: None,
         }
+    }
+}
+
+/// Risk overlay: caps the target exposure while a drawdown or downtrend rule is
+/// active. Signals use the close of day t and execute with `exec_lag_days` like every
+/// other trigger. Both rules have hysteresis so they do not flip every day.
+///
+/// * **Drawdown rule** — when strategy equity falls more than `dd_trigger` below its
+///   running peak, exposure is capped at `dd_exposure`; the cap is lifted once the
+///   drawdown is back within `dd_restore` of the peak, or after the underlying regains
+///   its trend (see below) if `dd_restore_on_trend` is set.
+/// * **Trend rule** — while the underlying's total-return close is below its
+///   `trend_sma`-day simple moving average by more than `trend_buffer`, exposure is
+///   capped at `trend_exposure`; it is restored once the close is above the SMA by
+///   `trend_buffer`.
+///
+/// A cap of 0 moves the strategy fully to cash (earning the risk-free rate).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RiskOverlay {
+    /// Drawdown from the equity peak that activates the cap (0.30 = −30%). None = off.
+    pub dd_trigger: Option<f64>,
+    /// Exposure cap while the drawdown rule is active (e.g. 1.0 or 0.5).
+    pub dd_exposure: f64,
+    /// Lift the cap when the drawdown is back within this distance of the peak.
+    pub dd_restore: f64,
+    /// Also lift the drawdown cap when the trend filter turns back up (re-arms at the
+    /// current equity as the new peak). Avoids staying de-levered for a decade after a
+    /// crash that the strategy never fully recovers from.
+    pub dd_restore_on_trend: bool,
+    /// Trend filter moving-average length in trading days (200 = classic). None = off.
+    pub trend_sma: Option<usize>,
+    /// Exposure cap while the close is below the moving average.
+    pub trend_exposure: f64,
+    /// Hysteresis band around the moving average (0.02 = ±2%).
+    pub trend_buffer: f64,
+}
+
+impl Default for RiskOverlay {
+    fn default() -> Self {
+        Self {
+            dd_trigger: None,
+            dd_exposure: 1.0,
+            dd_restore: 0.10,
+            dd_restore_on_trend: true,
+            trend_sma: None,
+            trend_exposure: 1.0,
+            trend_buffer: 0.02,
+        }
+    }
+}
+
+impl RiskOverlay {
+    pub fn is_active(&self) -> bool {
+        self.dd_trigger.is_some() || self.trend_sma.is_some()
+    }
+    /// Short label, e.g. `DD>30%→1.0x SMA200→0.5x`.
+    pub fn label(&self) -> String {
+        let mut v = Vec::new();
+        if let Some(t) = self.dd_trigger {
+            v.push(format!("DD>{:.0}%→{:.2}x", t * 100.0, self.dd_exposure));
+        }
+        if let Some(n) = self.trend_sma {
+            v.push(format!("SMA{n}→{:.2}x", self.trend_exposure));
+        }
+        v.join(" ")
     }
 }
 
@@ -237,6 +307,10 @@ impl RollConfig {
         }
         if let Some(b) = self.rebalance_band.filter(|b| *b > 0.0) {
             s.push_str(&format!(" ±{:.0}%", b * 100.0));
+        }
+        if self.risk.is_active() {
+            s.push(' ');
+            s.push_str(&self.risk.label());
         }
         s
     }
@@ -336,6 +410,9 @@ pub struct BacktestResult {
     /// even if not technically wiped out.
     #[serde(default)]
     pub near_wipe: bool,
+    /// Fraction of trading days on which the risk overlay capped the exposure.
+    #[serde(default)]
+    pub risk_capped_pct: f64,
 }
 
 impl BacktestResult {
@@ -498,6 +575,8 @@ struct Pos {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SimOut {
+    /// Days on which the risk overlay capped the exposure.
+    pub capped_days: usize,
     pub curve: Vec<(NaiveDate, f64)>,
     pub records: Vec<DayRecord>,
     pub trades: Vec<Trade>,
@@ -561,6 +640,8 @@ enum Act {
     Open,
     Roll(&'static str),
     Rebalance,
+    /// Sell the whole position and stay in cash (risk overlay cap = 0).
+    Close(&'static str),
 }
 
 /// Core simulation on aligned data. `full` = keep daily records and trade list.
@@ -578,6 +659,31 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
     let wipe_level = cfg.initial_capital * 1e-3;
     let min_dte_new = cfg.roll_dte + 14;
     let lag = cfg.exec_lag_days as usize;
+    let ro = cfg.risk;
+    // trailing SMA of the total-return close, computed over the whole aligned history
+    // so the filter is already warm on the first backtest day
+    let sma: Vec<f64> = match ro.trend_sma.filter(|n| *n >= 2) {
+        Some(n) => {
+            let mut v = vec![f64::NAN; al.adj.len()];
+            let mut acc = 0.0;
+            for (k, slot) in v.iter_mut().enumerate() {
+                acc += al.adj[k];
+                if k >= n {
+                    acc -= al.adj[k - n];
+                }
+                if k + 1 >= n {
+                    *slot = acc / n as f64;
+                }
+            }
+            v
+        }
+        None => Vec::new(),
+    };
+    let mut peak = cfg.initial_capital;
+    let mut dd_on = false;
+    let mut trend_down = false;
+    let mut prev_cap = f64::INFINITY;
+    let mut pending_target = cfg.target_exposure;
 
     let n_days = i1 - i0 + 1;
     let mut out = SimOut { i0, i1, min_equity_ratio: f64::INFINITY, ..Default::default() };
@@ -685,9 +791,46 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
             break;
         }
 
+        // 4b. risk overlay state (uses only today's close)
+        peak = peak.max(equity);
+        let mut trend_flip_up = false;
+        if !sma.is_empty() && sma[i].is_finite() {
+            let ratio = al.adj[i] / sma[i];
+            if trend_down && ratio > 1.0 + ro.trend_buffer {
+                trend_down = false;
+                trend_flip_up = true;
+            } else if !trend_down && ratio < 1.0 - ro.trend_buffer {
+                trend_down = true;
+            }
+        }
+        if let Some(trig) = ro.dd_trigger {
+            let dd = 1.0 - equity / peak.max(1e-12);
+            if !dd_on && dd > trig {
+                dd_on = true;
+            } else if dd_on && (dd < ro.dd_restore || (ro.dd_restore_on_trend && trend_flip_up)) {
+                dd_on = false;
+                peak = equity;
+            }
+        }
+        let mut cap = f64::INFINITY;
+        if dd_on {
+            cap = cap.min(ro.dd_exposure.max(0.0));
+        }
+        if trend_down && !sma.is_empty() {
+            cap = cap.min(ro.trend_exposure.max(0.0));
+        }
+        let eff_target = cfg.target_exposure.min(cap);
+        if eff_target < cfg.target_exposure {
+            out.capped_days += 1;
+        }
+        let cap_changed = cap != prev_cap;
+        prev_cap = cap;
+
         // 5. triggers (signal at today's close)
         let signal = match pos {
+            None if eff_target <= 1e-9 => Act::Nothing,
             None => Act::Open,
+            Some(_) if eff_target <= 1e-9 => Act::Close("風險規則：曝險上限為 0，轉為現金"),
             Some(p) => {
                 let dte = (p.expiry - d).num_days();
                 let exposure = if equity > 0.0 { g.delta * s * mult * p.n / equity } else { 0.0 };
@@ -699,7 +842,9 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
                     Act::Roll("Delta 過低，下移履約價")
                 } else if cfg.profit_take_pct.is_some_and(|x| g.price >= p.entry_mid * (1.0 + x)) {
                     Act::Roll("獲利了結並重設履約價")
-                } else if band > 0.0 && cfg.target_exposure > 0.0 && (exposure / cfg.target_exposure - 1.0).abs() > band {
+                } else if cap_changed && (exposure / eff_target - 1.0).abs() > 0.02 {
+                    Act::Rebalance
+                } else if band > 0.0 && eff_target > 0.0 && (exposure / eff_target - 1.0).abs() > band {
                     match cfg.strike {
                         StrikeSelection::Delta(td) if (g.delta - td).abs() > RESTRIKE_DELTA_GAP => {
                             Act::Roll("曝險與 Delta 皆偏離，重設履約價")
@@ -712,11 +857,16 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
             }
         };
         // execution, possibly delayed by `exec_lag_days`
+        if lag == 0 {
+            pending_target = eff_target;
+        }
+        let tgt = pending_target;
         let act = if lag == 0 {
             signal
         } else {
             if pending.is_none() && !matches!(signal, Act::Nothing) {
                 pending = Some((signal, i + lag));
+                pending_target = eff_target;
             }
             match pending {
                 Some((a, due)) if i >= due => {
@@ -728,7 +878,11 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
         };
         // the position may have expired while the order was pending
         let act = match (act, pos) {
-            (Act::Rebalance | Act::Roll(_), None) => Act::Open,
+            (Act::Rebalance | Act::Roll(_), None) if tgt > 1e-9 => Act::Open,
+            (Act::Rebalance | Act::Roll(_) | Act::Close(_), None) => Act::Nothing,
+            (Act::Open, Some(_)) => Act::Rebalance,
+            (Act::Open, None) if tgt <= 1e-9 => Act::Nothing,
+            (Act::Rebalance | Act::Roll(_), Some(_)) if tgt <= 1e-9 => Act::Close("風險規則：曝險上限為 0，轉為現金"),
             (a, _) => a,
         };
 
@@ -737,7 +891,7 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
             Act::Nothing => {}
             Act::Rebalance => {
                 let p = pos.as_mut().unwrap();
-                let target_n = cfg.target_exposure * equity / (g.delta * s * mult).max(1e-12);
+                let target_n = tgt * equity / (g.delta * s * mult).max(1e-12);
                 let buy = cm.buy_price_at(g.price, vix);
                 let sell = cm.sell_price_at(g.price, vix);
                 let mut new_n = target_n;
@@ -783,7 +937,37 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
                             delta: g.delta,
                             iv,
                             cost: c,
-                            reason: "曝險偏離目標，再平衡口數".into(),
+                            reason: if tgt < cfg.target_exposure { "風險規則調整曝險，再平衡口數".into() } else { "曝險偏離目標，再平衡口數".into() },
+                        });
+                    }
+                }
+            }
+            Act::Close(reason) => {
+                if let Some(p) = pos.take() {
+                    let mut sell = cm.sell_price_at(g.price, vix);
+                    let mut leg_comm = comm;
+                    if sell * mult <= comm {
+                        sell = 0.0;
+                        leg_comm = 0.0;
+                    }
+                    let c = p.n * (g.price - sell) * mult + p.n * leg_comm;
+                    cash += p.n * sell * mult - p.n * leg_comm;
+                    out.total_costs += c;
+                    traded = true;
+                    if full {
+                        out.trades.push(Trade {
+                            date: d,
+                            action: TradeAction::Close,
+                            kind: OptionKind::Call,
+                            strike: p.strike,
+                            expiry: p.expiry,
+                            contracts: -p.n,
+                            price: sell,
+                            underlying: s,
+                            delta: g.delta,
+                            iv,
+                            cost: c,
+                            reason: reason.into(),
                         });
                     }
                 }
@@ -838,7 +1022,7 @@ pub(crate) fn simulate(al: &Aligned, cfg: &RollConfig, full: bool) -> Result<Sim
                 let buy = cm.buy_price_at(mid, vix);
                 if mid > 0.0 && ng.delta > 1e-6 && equity_now > 0.0 {
                     let unit = buy * mult + comm;
-                    let target_n = cfg.target_exposure * equity_now / (ng.delta * s * mult);
+                    let target_n = tgt * equity_now / (ng.delta * s * mult);
                     let cap_n = cfg.max_premium_pct * equity_now / unit;
                     let cash_n = cash / unit;
                     let mut n = target_n.min(cap_n).min(cash_n).max(0.0);
@@ -1017,6 +1201,7 @@ pub(crate) fn run_on_aligned(al: &Aligned, cfg: &RollConfig) -> Result<BacktestR
         wiped_date: sim.wiped_date,
         min_equity_ratio: sim.min_equity_ratio,
         near_wipe: sim.near_wipe,
+        risk_capped_pct: sim.capped_days as f64 / (sim.i1 - sim.i0 + 1).max(1) as f64,
     })
 }
 
@@ -1274,4 +1459,67 @@ mod tests {
         assert!(res.records.last().unwrap().date <= e);
         assert!(run_backtest(&data, &RollConfig { entry_dte: 100, roll_dte: 120, ..cfg }).is_err());
     }
+
+    #[test]
+    fn risk_overlay_trend_filter_goes_to_cash_in_a_downtrend() {
+        // up 1y, crash -60% over 1y, flat 1y
+        let data = synthetic_crash_data();
+        let base = RollConfig { target_exposure: 2.0, exec_lag_days: 1, ..RollConfig::default() };
+        let plain = run_backtest(&data, &base).unwrap();
+        let mut cfg = base.clone();
+        cfg.risk = RiskOverlay { trend_sma: Some(50), trend_exposure: 0.0, ..RiskOverlay::default() };
+        let filt = run_backtest(&data, &cfg).unwrap();
+        assert!(filt.risk_capped_pct > 0.2, "{}", filt.risk_capped_pct);
+        assert!(filt.min_equity_ratio > plain.min_equity_ratio + 0.2, "{} vs {}", filt.min_equity_ratio, plain.min_equity_ratio);
+        assert!(filt.trades.iter().any(|t| t.action == TradeAction::Close && t.reason.contains("風險")));
+        // while capped at 0 the strategy holds no contracts
+        assert!(filt.records.iter().any(|r| r.contracts == 0.0));
+        assert!(cfg.label().contains("SMA50→0.00x"));
+    }
+
+    #[test]
+    fn risk_overlay_drawdown_rule_caps_exposure() {
+        let data = synthetic_crash_data();
+        let base = RollConfig { target_exposure: 2.0, rebalance_band: Some(0.25), ..RollConfig::default() };
+        let mut cfg = base.clone();
+        cfg.risk = RiskOverlay { dd_trigger: Some(0.25), dd_exposure: 0.5, dd_restore_on_trend: false, ..RiskOverlay::default() };
+        let r = run_backtest(&data, &cfg).unwrap();
+        let plain = run_backtest(&data, &base).unwrap();
+        assert!(r.risk_capped_pct > 0.0);
+        assert!(r.min_equity_ratio > plain.min_equity_ratio, "{} vs {}", r.min_equity_ratio, plain.min_equity_ratio);
+        // after the trigger, realised exposure must come down towards the 0.5x cap
+        let capped: Vec<f64> = r.records.iter().filter(|x| x.contracts > 0.0).map(|x| x.exposure).collect();
+        assert!(capped.iter().any(|e| *e < 0.8), "never de-levered");
+    }
+
+    #[test]
+    fn risk_overlay_off_is_bit_identical() {
+        let data = synthetic_crash_data();
+        let a = run_backtest(&data, &RollConfig::default()).unwrap();
+        let b = run_backtest(&data, &RollConfig { risk: RiskOverlay { dd_exposure: 0.3, trend_exposure: 0.1, ..RiskOverlay::default() }, ..RollConfig::default() }).unwrap();
+        assert_eq!(a.stats.final_value, b.stats.final_value);
+        assert_eq!(b.risk_capped_pct, 0.0);
+    }
+
+    fn synthetic_crash_data() -> BacktestData {
+        use crate::history::Bar;
+        let start = NaiveDate::from_ymd_opt(2010, 1, 4).unwrap();
+        let mut bars = Vec::new();
+        let mut p = 100.0;
+        let mut d = start;
+        let mut k = 0;
+        while k < 756 {
+            if d.weekday().number_from_monday() <= 5 {
+                let drift = if k < 252 { 0.0008 } else if k < 504 { -0.0036 } else { 0.0002 };
+                let wiggle = 0.004 * ((k as f64) * 0.7).sin();
+                p *= 1.0 + drift + wiggle;
+                bars.push(Bar { date: d, open: p, high: p, low: p, close: p, adj_close: p, volume: 0.0 });
+                k += 1;
+            }
+            d += chrono::Duration::days(1);
+        }
+        let vol = ScalarSeries::new("VIX", bars.iter().enumerate().map(|(i, b)| (b.date, if (252..504).contains(&i) { 45.0 } else { 18.0 })).collect());
+        BacktestData::new(PriceSeries::new("TEST", bars), vol, RateSource::Constant(0.03), 0.0)
+    }
+
 }
