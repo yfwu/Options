@@ -1,14 +1,17 @@
 # OptLab 選擇權實驗室
 
-用 Rust 寫的本地選擇權策略實驗軟體，介面使用 [GPUI](https://gpui.rs)（Zed 編輯器的 UI 框架）加上 gpui-component。重點是**長期看多、滾動 LEAPS 買權、用選擇權對美股（QQQ / SPY / 科技股）開槓桿**，並用回測、拔靴法、壓力測試找出穩健的做法，而不是追逐 alpha。
+用 Rust 寫的本地選擇權實驗軟體，介面使用 [GPUI](https://gpui.rs)（Zed 編輯器的 UI 框架）加上 gpui-component。
 
-![回測頁](docs/screenshots/backtest.png)
+核心想法：**選擇權是一種程式語言**。股票的報酬是線性的；選擇權讓你組合出非線性、非對稱的報酬函數。OptLab 的主頁「函數工作室」讓你直接寫出想要的到期報酬 f(S)，由編譯器把它拆成最基本的「指令」：現金（零息債）、股票、`Call(K)`、`Put(K)`。接著用真實或合成的期權鏈替它定價，並顯示複製誤差、Greeks，以及在風險中性與真實世界機率下的報酬分佈。其他頁面（LEAPS 滾動回測、參數優化、崩盤壓力測試）則用來研究長期槓桿做多。
+
+![函數工作室](docs/screenshots/studio.png)
 
 > ⚠️ 本軟體是研究工具，不是投資建議。歷史期權價格是用波動率指數合成的（見〈方法與限制〉）；槓桿部位在 2000 年型的崩盤中可能實質歸零。
 
 ---
 
 ## 目錄
+- [Payoff 語言與編譯器](#payoff-語言與編譯器)
 - [功能](#功能)
 - [安裝與執行](#安裝與執行)
 - [資料來源](#資料來源)
@@ -17,10 +20,65 @@
 - [方法與限制](#方法與限制)
 - [專案結構與測試](#專案結構與測試)
 
+## Payoff 語言與編譯器
+
+```text
+# 變數、百分比（相對現價）、巨集與註解
+k = 100%
+cap = 115%
+2 * bull(k, cap)                 # 上漲 2 倍參與到 +15%，下跌只賠權利金
+```
+
+| 類別 | 語法 |
+|---|---|
+| 變數 | `S` 到期價格、`spot` 現價、`110%` = 1.10 × spot、`a = 600` 定義變數、`;` 或換行分隔、`#` 註解 |
+| 基本元件 | `call(K)` `put(K)` `digital(K)` `digitalput(K)` `pwl(x1,y1, x2,y2, …)`（用點直接畫折線） |
+| 巨集 | `straddle(K)` `strangle(Kp,Kc)` `bull(K1,K2)` `bear(K1,K2)` `butterfly(K1,K2,K3)` `condor(…)` `collar(Kp,Kc)` `protect(K)` |
+| 運算 | `+ - * / ^`、`max min abs pos neg clamp sqrt ln exp` |
+
+**編譯原理（靜態複製）：** 任何分段線性函數都可以精確寫成
+
+```text
+f(S) = a + b·S + Σᵢ wᵢ·(S − Kᵢ)⁺
+```
+
+其中 `wᵢ` 是轉折點 `Kᵢ` 的斜率變化。再用 put–call parity `(S−K)⁺ = (K−S)⁺ + S − K` 決定哪些轉折點用買權、哪些用賣權。
+
+- **預設「最少部位」**：選擇所需股票部位最小的拆法。例如：
+  - 多頭價差 → 兩個買權
+  - 保護性賣權 → 零息債 + 買權（parity 等價的 fiduciary call）
+  - 緩衝型結構商品 → 債券 + 買權價差 − 賣權
+- **可交易履約價**：轉折點會對齊到可交易履約價，取整誤差會顯示出來。
+- **跳躍**：數位選擇權這類跳躍，以相鄰履約價的窄價差近似。
+- **平滑函數**：`ln`、`S²` 這類函數在履約價網格上做分段線性近似（Carr–Madan），並顯示近似誤差。
+
+**定價與分析：**
+- 價格：中價與可成交價（買在 ask、賣在 bid）。
+- 公允值：用 Breeden–Litzenberger 由微笑曲線求出風險中性密度，積分得到公允值；與各腿價格吻合到約 0.01%。
+- 真實世界分佈：以 Esscher tilt 把風險中性分佈調整成指定漂移 μ，求出期望損益、獲利機率、P5/P50/P95 與損益兩平點。
+- 圖表（GUI）：目標 f(S) 對照複製 g(S)、今日與半途價值曲線、機率分佈，以及「函數 = 基本元件之和」的分解圖。
+
+在命令列使用：
+
+```bash
+./target/release/optlab payoff --examples
+```
+
+```bash
+./target/release/optlab payoff "S + bear(90%, 100%) - call(112%)" --symbol QQQ --days 365
+```
+
+```bash
+./target/release/optlab payoff "pwl(80%,-10, 100%,0, 120%,40)" --chain-file my_snapshot.json
+```
+
+![平滑函數的近似複製](docs/screenshots/studio_smooth.png)
+
 ## 功能
 
 | 頁面 | 內容 |
 |---|---|
+| **函數工作室**（主頁） | 用 payoff 語言寫函數，自動編譯、即時定價，提供誤差、Greeks、Q/P 分佈與分解圖；可複製公式、匯出 CSV、送到策略實驗室 |
 | **市場總覽** | 價格與 50/200 日均線、VXN/VIX 與實現波動、IV Rank/百分位、距高點回撤、趨勢狀態，以及依當前市況產生的建議卡片 |
 | **期權鏈** | 從 CBOE（免金鑰）、Yahoo、Tradier、Polygon/Massive、本地快照或 CSV 讀取期權鏈。T 字報價（Bid/Ask/IV/Δ/OI）並標示價內與 ATM；預期波動、25Δ 偏斜、P/C 比、最大痛點、GEX 與 Gamma 翻轉點；IV 微笑、ATM 期限結構、GEX 長條圖；可存成快照或匯出 CSV |
 | **策略實驗室** | 16 種內建策略（LEAPS 股票替代、PMCC、多頭價差、合成多頭、風險逆轉、領口、對角、鐵兀鷹…），每種都有中文說明。可從真實期權鏈或 Black-Scholes 合成市場建立；顯示損益圖（到期／今日／中間日）、部位 Greeks、損益兩平、最大損益、勝率、期望值，以及 Monte Carlo 損益分佈（GBM / Merton 跳躍 / Heston / 歷史拔靴） |
@@ -29,7 +87,7 @@
 | **策略知識庫** | 滾動 LEAPS 操作手冊、常見做法的綜合結論、LEAPS 持有成本表（Δ×DTE）、崩盤壓力表、所有策略說明 |
 | **設定** | Tradier / Polygon 金鑰、預設資料來源、無風險利率、股息率、離線模式、快照清單、內建資料目錄 |
 
-快捷鍵（macOS 用 ⌘，其他平台用 Ctrl）：`1`–`6` 切換頁面、`,` 開啟設定、`B` 收合側欄、`Enter` 執行目前頁面的主要動作、`Q` 離開。
+快捷鍵（macOS 用 ⌘，其他平台用 Ctrl）：`1`–`7` 切換頁面、`,` 開啟設定、`B` 收合側欄、`Enter` 執行目前頁面的主要動作、`Q` 離開。
 
 ## 安裝與執行
 
@@ -53,7 +111,7 @@ sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev lib
 
 > `Cargo.lock` 把 `libc` 鎖在 0.2.189（較新版 libc 會讓 gpui 依賴的 `xattr 0.2.3` 編譯失敗）。請使用 `--locked`，不要直接執行 `cargo update`。
 
-可用環境變數控制啟動方式：`OPTLAB_PAGE=backtest`（或 `dashboard|chain|strategy|optimizer|guide|settings`）指定開啟頁面、`OPTLAB_AUTORUN=1` 啟動後自動執行、`OPTLAB_WINDOW=1560x930` 設定視窗大小、`OPTLAB_HOME=…` 改用可攜資料夾。
+可用環境變數控制啟動方式：`OPTLAB_PAGE=backtest`（或 `studio|dashboard|chain|strategy|optimizer|guide|settings`）指定開啟頁面、`OPTLAB_AUTORUN=1` 啟動後自動執行、`OPTLAB_WINDOW=1560x930` 設定視窗大小、`OPTLAB_HOME=…` 改用可攜資料夾。
 
 ## 資料來源
 
@@ -168,7 +226,7 @@ cargo build --locked --release -p optlab-cli
 ## 專案結構與測試
 
 ```
-crates/core   optlab-core：定價（BSM/Greeks/IV/二元樹）、期權鏈模型、波動曲面與期權鏈分析、
+crates/core   optlab-core：payoff 語言與編譯器（payoff.rs）、定價（BSM/Greeks/IV/二元樹）、期權鏈模型、波動曲面與期權鏈分析、
               策略與 16 個範本、Monte Carlo、合成波動與成本模型、績效統計、
               LEAPS 滾動回測、優化器（網格/穩健/walk-forward/拔靴/熱圖）、建議引擎
 crates/data   optlab-data：CBOE/Yahoo/Tradier/Polygon 供應者、CSV 匯入、快照儲存、設定、

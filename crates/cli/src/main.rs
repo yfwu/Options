@@ -266,8 +266,8 @@ enum Cmd {
         /// Real-world annual drift for the P-measure statistics.
         #[arg(long, default_value_t = 0.08)]
         mu: f64,
-        /// otm (puts below spot, calls above) | calls | puts
-        #[arg(long, default_value = "otm")]
+        /// minimal (fewest instruments) | otm (puts below spot, calls above) | calls | puts
+        #[arg(long, default_value = "minimal")]
         style: String,
         /// Strike step for free-grid compilation (default: by price level).
         #[arg(long)]
@@ -717,7 +717,8 @@ fn run_payoff(a: PayoffArgs) -> Result<()> {
     let style = match a.style.as_str() {
         "calls" => LegStyle::AllCalls,
         "puts" => LegStyle::AllPuts,
-        _ => LegStyle::OutOfTheMoney,
+        "otm" => LegStyle::OutOfTheMoney,
+        _ => LegStyle::Minimal,
     };
     // market
     let chain = if let Some(p) = &a.chain_file {
@@ -769,7 +770,7 @@ fn run_payoff(a: PayoffArgs) -> Result<()> {
     let px = price(&prog, &rep, &mkt, a.units, a.mu);
 
     println!("\n編譯結果  f(S) ≈ {}", rep.formula());
-    println!("複製誤差：最大 {:.4}  平均 {:.4}（區間 {:.0}–{:.0}）{}", rep.max_error, rep.mean_error, spot * 0.5, spot * 1.6, if rep.approximated { "  [近似]" } else { "  [精確]" });
+    println!("複製誤差：最大 {:.4}  平均 {:.4}（區間 {:.0}–{:.0}）{}", rep.max_error, rep.mean_error, spot * 0.5, spot * 1.6, if rep.approximated { "  [近似]" } else if !rep.snapped.is_empty() { "  [形狀精確，履約價取整]" } else { "  [精確]" });
     for w in &rep.warnings {
         println!("  ⚠ {w}");
     }

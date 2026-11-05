@@ -704,7 +704,33 @@ pub fn compile(prog: &Program, opt: &CompileOptions) -> Result<Replication> {
     // keep the curve anchored where it matters: after snapping, shift the bond leg so
     // that the replicated payoff equals the target at spot (snapping error moves to the tail)
     let g_at = |x: f64| intercept + s0 * x + merged.iter().map(|(k, w)| w * (x - k).max(0.0)).sum::<f64>();
-    let anchor_shift = if rep_needs_anchor(&opt.grid) { f(spot) - g_at(spot) } else { 0.0 };
+    // Snapping moves kinks, which can leave a constant offset on one side. Choose the
+    // bond-leg shift that minimises the mean |f − g| over the error range among: no shift,
+    // matching at spot, or matching in the middle of each linear segment; prefer no shift
+    // unless another candidate is clearly (>5%) better.
+    let anchor_shift = if rep_needs_anchor(&opt.grid) && !snapped.is_empty() {
+        let (lo, hi) = (opt.error_range.0 * spot, opt.error_range.1 * spot);
+        let xs: Vec<f64> = (0..=400).map(|i| lo + (hi - lo) * i as f64 / 400.0).collect();
+        let fx: Vec<f64> = xs.iter().map(|&x| f(x)).collect();
+        let gx: Vec<f64> = xs.iter().map(|&x| g_at(x)).collect();
+        let mean_err = |c: f64| fx.iter().zip(&gx).map(|(a, b)| (a - b - c).abs()).sum::<f64>() / xs.len() as f64;
+        let mut cands = vec![f(spot) - g_at(spot)];
+        let mut bounds: Vec<f64> = vec![lo];
+        bounds.extend(merged.iter().map(|n| n.0).filter(|k| *k > lo && *k < hi));
+        bounds.push(hi);
+        for w in bounds.windows(2) {
+            let m = 0.5 * (w[0] + w[1]);
+            cands.push(f(m) - g_at(m));
+        }
+        let base = mean_err(0.0);
+        let best = cands.into_iter().map(|c| (c, mean_err(c))).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        match best {
+            Some((c, e)) if e < 0.95 * base => c,
+            _ => 0.0,
+        }
+    } else {
+        0.0
+    };
     let intercept = intercept + anchor_shift;
 
     // lower to instruments
@@ -1309,6 +1335,9 @@ mod tests {
         // protective put snapped: error only below the kink, none above
         let r = compile(&p("S + put(95%)"), &CompileOptions::free(685.28)).unwrap();
         assert!((r.payoff(800.0) - 800.0).abs() < 1e-9, "{}", r.payoff(800.0));
+        // snapped bull spread: just the rounded call spread, no bond leg
+        let r = compile(&p("2*bull(100%, 115%)"), &CompileOptions::free(685.28)).unwrap();
+        assert!(!r.legs.iter().any(|l| l.instrument == Instrument::Cash), "{:?}", r.legs);
         // digital → tight call spread
         let r = compile(&p("100*digital(630)"), &CompileOptions::free(600.0)).unwrap();
         assert!(r.legs.iter().filter(|l| matches!(l.instrument, Instrument::Call(_))).count() >= 2);

@@ -149,6 +149,10 @@ pub struct ChartSpec {
     pub include_zero: bool,
     pub legend: bool,
     pub empty_text: SharedString,
+    /// Force the x range (aligns stacked charts).
+    pub x_range: Option<(f64, f64)>,
+    /// Minimum left margin in px (aligns stacked charts).
+    pub min_left: f32,
 }
 
 impl Default for ChartSpec {
@@ -166,6 +170,8 @@ impl Default for ChartSpec {
             include_zero: false,
             legend: true,
             empty_text: "無資料".into(),
+            x_range: None,
+            min_left: 0.0,
         }
     }
 }
@@ -205,6 +211,14 @@ impl ChartSpec {
     }
     pub fn include_zero(mut self) -> Self {
         self.include_zero = true;
+        self
+    }
+    pub fn x_range(mut self, lo: f64, hi: f64) -> Self {
+        self.x_range = Some((lo, hi));
+        self
+    }
+    pub fn min_left(mut self, px: f32) -> Self {
+        self.min_left = px;
         self
     }
     pub fn no_legend(mut self) -> Self {
@@ -745,6 +759,10 @@ fn paint_xy(spec: &ChartSpec, bounds: Bounds<Pixels>, window: &mut Window, cx: &
     if let Some(v) = spec.y_max {
         ymax = v;
     }
+    if let Some((a, b)) = spec.x_range {
+        xmin = a;
+        xmax = b;
+    }
     if xmax <= xmin {
         xmin -= 1.0;
         xmax += 1.0;
@@ -774,7 +792,7 @@ fn paint_xy(spec: &ChartSpec, bounds: Bounds<Pixels>, window: &mut Window, cx: &
         .iter()
         .map(|l| text_width(l, fs, true, window, cx))
         .fold(0.0f32, f32::max);
-    let left = lw + 10.0;
+    let left = (lw + 10.0).max(spec.min_left);
     let right = 12.0;
     let top = 8.0;
     let bottom = 20.0;

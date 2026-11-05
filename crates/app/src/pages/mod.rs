@@ -5,3 +5,4 @@ pub mod guide;
 pub mod optimizer;
 pub mod settings;
 pub mod strategy;
+pub mod studio;

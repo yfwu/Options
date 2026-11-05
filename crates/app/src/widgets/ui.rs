@@ -590,3 +590,20 @@ pub fn advice_card(a: &optlab_core::advisor::Advice, cx: &App) -> Div {
                 .child(div().text_size(px(12.0)).text_color(theme.muted_foreground).child(a.body.clone())),
         )
 }
+
+/// Compact KPI tile for narrow side panels.
+pub fn kpi_sm(label: impl Into<SharedString>, value: impl Into<SharedString>, color: Option<Hsla>, cx: &App) -> Div {
+    let theme = cx.theme();
+    v_flex()
+        .min_w(px(70.0))
+        .flex_1()
+        .px_1p5()
+        .py_1()
+        .gap_0p5()
+        .border_1()
+        .border_color(theme.border)
+        .rounded(px(4.0))
+        .bg(theme.sidebar)
+        .child(div().text_size(px(10.5)).text_color(theme.muted_foreground).whitespace_nowrap().child(label.into()))
+        .child(div().font_family(MONO_FONT).text_size(px(13.0)).whitespace_nowrap().text_color(color.unwrap_or(theme.foreground)).child(value.into()))
+}

@@ -1,7 +1,7 @@
 //! OptLab 選擇權實驗室 — desktop GUI (GPUI + gpui-component).
 //!
 //! CLI / env options:
-//! * `--page <dashboard|chain|strategy|backtest|optimizer|guide|settings>` or `OPTLAB_PAGE`
+//! * `--page <studio|dashboard|chain|strategy|backtest|optimizer|guide|settings>` or `OPTLAB_PAGE`
 //! * `OPTLAB_AUTORUN=1` — auto-run the default backtest / optimiser / chain demo on launch
 //! * `OPTLAB_WINDOW=1600x1000` — initial window size
 
@@ -42,7 +42,7 @@ fn launch_options() -> LaunchOptions {
             page = Page::from_key(v).or(page);
         } else if a == "--help" || a == "-h" {
             println!(
-                "optlab-app [--page dashboard|chain|strategy|backtest|optimizer|guide|settings]\n\
+                "optlab-app [--page studio|dashboard|chain|strategy|backtest|optimizer|guide|settings]\n\
                  env: OPTLAB_PAGE, OPTLAB_AUTORUN=1, OPTLAB_WINDOW=WxH"
             );
             std::process::exit(0);
@@ -50,7 +50,7 @@ fn launch_options() -> LaunchOptions {
         i += 1;
     }
     let autorun = std::env::var("OPTLAB_AUTORUN").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
-    LaunchOptions { page: page.unwrap_or(Page::Dashboard), autorun }
+    LaunchOptions { page: page.unwrap_or(Page::Studio), autorun }
 }
 
 fn window_size() -> (f32, f32) {
@@ -69,12 +69,13 @@ fn bind_keys(cx: &mut App) {
     #[cfg(not(target_os = "macos"))]
     let m = "ctrl";
     cx.bind_keys([
-        KeyBinding::new(&format!("{m}-1"), GoDashboard, None),
-        KeyBinding::new(&format!("{m}-2"), GoChain, None),
-        KeyBinding::new(&format!("{m}-3"), GoStrategy, None),
-        KeyBinding::new(&format!("{m}-4"), GoBacktest, None),
-        KeyBinding::new(&format!("{m}-5"), GoOptimizer, None),
-        KeyBinding::new(&format!("{m}-6"), GoGuide, None),
+        KeyBinding::new(&format!("{m}-1"), GoStudio, None),
+        KeyBinding::new(&format!("{m}-2"), GoDashboard, None),
+        KeyBinding::new(&format!("{m}-3"), GoChain, None),
+        KeyBinding::new(&format!("{m}-4"), GoStrategy, None),
+        KeyBinding::new(&format!("{m}-5"), GoBacktest, None),
+        KeyBinding::new(&format!("{m}-6"), GoOptimizer, None),
+        KeyBinding::new(&format!("{m}-7"), GoGuide, None),
         KeyBinding::new(&format!("{m}-,"), GoSettings, None),
         KeyBinding::new(&format!("{m}-b"), ToggleSidebar, None),
         KeyBinding::new(&format!("{m}-enter"), RunCurrent, None),

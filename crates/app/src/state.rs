@@ -10,6 +10,7 @@ use crate::data_bridge::{self, Settings};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Page {
+    Studio,
     Dashboard,
     Chain,
     Strategy,
@@ -20,7 +21,8 @@ pub enum Page {
 }
 
 impl Page {
-    pub const ALL: [Page; 7] = [
+    pub const ALL: [Page; 8] = [
+        Page::Studio,
         Page::Dashboard,
         Page::Chain,
         Page::Strategy,
@@ -32,6 +34,7 @@ impl Page {
 
     pub fn title(self) -> &'static str {
         match self {
+            Page::Studio => "函數工作室",
             Page::Dashboard => "市場總覽",
             Page::Chain => "期權鏈",
             Page::Strategy => "策略實驗室",
@@ -44,6 +47,7 @@ impl Page {
 
     pub fn subtitle(self) -> &'static str {
         match self {
+            Page::Studio => "Payoff Studio",
             Page::Dashboard => "Dashboard",
             Page::Chain => "Option Chain",
             Page::Strategy => "Strategy Lab",
@@ -56,6 +60,7 @@ impl Page {
 
     pub fn icon(self) -> &'static str {
         match self {
+            Page::Studio => "icons/function.svg",
             Page::Dashboard => "icons/layout-dashboard.svg",
             Page::Chain => "icons/table.svg",
             Page::Strategy => "icons/flask-conical.svg",
@@ -68,6 +73,7 @@ impl Page {
 
     pub fn key(self) -> &'static str {
         match self {
+            Page::Studio => "studio",
             Page::Dashboard => "dashboard",
             Page::Chain => "chain",
             Page::Strategy => "strategy",
@@ -80,7 +86,7 @@ impl Page {
 
     pub fn from_key(s: &str) -> Option<Page> {
         let s = s.trim().to_ascii_lowercase();
-        Page::ALL.iter().copied().find(|p| p.key() == s || (s == "lab" && *p == Page::Strategy) || (s == "optimize" && *p == Page::Optimizer))
+        Page::ALL.iter().copied().find(|p| p.key() == s || (s == "lab" && *p == Page::Strategy) || ((s == "payoff" || s == "function") && *p == Page::Studio) || (s == "optimize" && *p == Page::Optimizer))
     }
 }
 
@@ -99,6 +105,8 @@ pub enum AppEvent {
     /// Optimiser → backtest: apply these parameters (delta, entry DTE, roll DTE, exposure...).
     ApplyBacktestParams(Box<crate::pages::backtest::BacktestParamsPatch>),
     SettingsChanged,
+    /// Payoff Studio → Strategy Lab: (strategy, spot, r, q, label).
+    OpenInStrategyLab(Box<(optlab_core::strategy::Strategy, f64, f64, f64, String)>),
 }
 
 pub struct AppState {

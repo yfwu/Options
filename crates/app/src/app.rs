@@ -7,7 +7,7 @@ use gpui::{
 use gpui_component::{h_flex, v_flex, ActiveTheme, Root};
 
 use crate::pages::{
-    backtest::BacktestPage, chain::ChainPage, dashboard::DashboardPage, guide::GuidePage,
+    backtest::BacktestPage, chain::ChainPage, dashboard::DashboardPage, guide::GuidePage, studio::StudioPage,
     optimizer::OptimizerPage, settings::SettingsPage, strategy::StrategyPage,
 };
 use crate::state::{AppEvent, AppState, Page, StatusLevel};
@@ -16,6 +16,7 @@ use crate::theme::{palette, MONO_FONT, UI_FONT};
 actions!(
     optlab,
     [
+        GoStudio,
         GoDashboard,
         GoChain,
         GoStrategy,
@@ -34,6 +35,7 @@ pub struct OptLabApp {
     page: Page,
     collapsed: bool,
     focus: FocusHandle,
+    studio: Entity<StudioPage>,
     dashboard: Entity<DashboardPage>,
     chain: Entity<ChainPage>,
     strategy: Entity<StrategyPage>,
@@ -47,6 +49,7 @@ pub struct OptLabApp {
 impl OptLabApp {
     pub fn new(page: Page, autorun: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let state = cx.new(|_| AppState::new());
+        let studio = cx.new(|cx| StudioPage::new(state.clone(), window, cx));
         let dashboard = cx.new(|cx| DashboardPage::new(state.clone(), window, cx));
         let chain = cx.new(|cx| ChainPage::new(state.clone(), window, cx));
         let strategy = cx.new(|cx| StrategyPage::new(state.clone(), window, cx));
@@ -71,6 +74,12 @@ impl OptLabApp {
                     this.strategy.update(cx, |s, cx| s.on_chain_changed(window, cx));
                 }
                 AppEvent::SettingsChanged => {}
+                AppEvent::OpenInStrategyLab(b) => {
+                    let (strat, spot, r, q, label) = (**b).clone();
+                    this.strategy.update(cx, |s, cx| s.load_external(strat, spot, r, q, label, window, cx));
+                    this.page = Page::Strategy;
+                    cx.notify();
+                }
             }),
             cx.observe(&state, |_, _, cx| cx.notify()),
         ];
@@ -83,6 +92,7 @@ impl OptLabApp {
             page,
             collapsed: false,
             focus,
+            studio,
             dashboard,
             chain,
             strategy,
@@ -119,6 +129,7 @@ impl OptLabApp {
             Page::Chain => self.chain.update(cx, |p, cx| p.fetch(window, cx)),
             Page::Strategy => self.strategy.update(cx, |p, cx| p.rebuild(window, cx)),
             Page::Dashboard => self.dashboard.update(cx, |p, cx| p.reload(window, cx)),
+            Page::Studio => self.studio.update(cx, |p, cx| p.recompile(cx)),
             _ => {}
         }
     }
@@ -280,6 +291,7 @@ impl OptLabApp {
 
     fn render_page(&self) -> AnyElement {
         match self.page {
+            Page::Studio => self.studio.clone().into_any_element(),
             Page::Dashboard => self.dashboard.clone().into_any_element(),
             Page::Chain => self.chain.clone().into_any_element(),
             Page::Strategy => self.strategy.clone().into_any_element(),
@@ -314,6 +326,7 @@ impl Render for OptLabApp {
             .text_color(theme.foreground)
             .font_family(UI_FONT)
             .text_size(px(13.0))
+            .on_action(cx.listener(|this, _: &GoStudio, _, cx| this.go(Page::Studio, cx)))
             .on_action(cx.listener(|this, _: &GoDashboard, _, cx| this.go(Page::Dashboard, cx)))
             .on_action(cx.listener(|this, _: &GoChain, _, cx| this.go(Page::Chain, cx)))
             .on_action(cx.listener(|this, _: &GoStrategy, _, cx| this.go(Page::Strategy, cx)))

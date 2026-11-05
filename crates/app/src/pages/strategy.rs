@@ -83,6 +83,8 @@ pub struct StrategyPage {
     mc: Option<(Distribution, Rc<ChartSpec>, String)>,
     mc_running: bool,
     mc_gen: u64,
+    /// Set when the current strategy came from outside (Payoff Studio).
+    external: Option<String>,
 }
 
 impl StrategyPage {
@@ -124,6 +126,7 @@ impl StrategyPage {
             mc: None,
             mc_running: false,
             mc_gen: 0,
+            external: None,
         };
         this.rebuild(window, cx);
         this
@@ -195,7 +198,7 @@ impl StrategyPage {
                 Ok((s, spot, today, false))
             }
         };
-        let (strategy, spot0, created, from_chain) = match res {
+        let (strategy, spot0, _created, from_chain) = match res {
             Ok(v) => v,
             Err(err) => {
                 self.build_error = Some(err.clone());
@@ -206,8 +209,15 @@ impl StrategyPage {
             }
         };
         self.build_error = None;
+        self.external = None;
+        self.finish_build(strategy, spot0, r, q, vol_shift, iv, drift, eval_days, from_chain, cx);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_build(&mut self, strategy: Strategy, spot0: f64, r: f64, q: f64, vol_shift: f64, iv: f64, drift: f64, eval_days: Option<i64>, from_chain: bool, cx: &mut Context<Self>) {
+        let created = strategy.created;
         let params = MarketParams::new(spot0, r, q).with_vol_shift(vol_shift);
-        // sigma for probability: average IV of option legs (vega-ish weighting by |qty|)
+        // sigma for probability: average IV of option legs (weighted by |qty|)
         let opt_legs: Vec<_> = strategy.legs.iter().filter(|l| l.is_option()).collect();
         let sigma = if opt_legs.is_empty() {
             iv
@@ -227,6 +237,23 @@ impl StrategyPage {
         self.mc = None;
         self.run_mc(cx);
         cx.notify();
+    }
+
+    /// Load a ready-made strategy (e.g. compiled in the Payoff Studio) instead of a template.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_external(&mut self, strategy: Strategy, spot: f64, r: f64, q: f64, label: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.use_chain = false;
+        let sym = strategy.underlying.clone();
+        let set = |e: &Entity<InputState>, v: String, window: &mut Window, cx: &mut Context<Self>| e.update(cx, |s, cx| s.set_value(v, window, cx));
+        set(&self.inp.symbol, sym, window, cx);
+        set(&self.inp.spot, format!("{spot:.2}"), window, cx);
+        set(&self.inp.r, format!("{:.2}", r * 100.0), window, cx);
+        set(&self.inp.q, format!("{:.2}", q * 100.0), window, cx);
+        let iv = strategy.legs.iter().find(|l| l.is_option()).map(|l| l.iv).unwrap_or(0.2);
+        self.build_error = None;
+        self.errors = FormErrors::default();
+        self.external = Some(label);
+        self.finish_build(strategy, spot, r, q, 0.0, iv, r - q, None, false, cx);
     }
 
     fn payoff_chart(s: &Strategy, params: &MarketParams, created: NaiveDate, mid: NaiveDate, exp: NaiveDate, sum: &StrategySummary, sigma: f64) -> Rc<ChartSpec> {
@@ -434,7 +461,7 @@ impl StrategyPage {
                 &cols,
                 vec![
                     Cell::new(kind).color(if kind == "Put" { p.red } else { p.green }),
-                    Cell::new(format!("{:+}", l.quantity)).color(sign_color(l.quantity)),
+                    Cell::new(if (l.quantity - l.quantity.round()).abs() < 1e-6 { format!("{:+}", l.quantity.round()) } else { format!("{:+.3}", l.quantity) }).color(sign_color(l.quantity)),
                     Cell::new(k),
                     Cell::new(exp),
                     Cell::new(dte),
@@ -500,6 +527,7 @@ impl StrategyPage {
                     .gap_2()
                     .child(div().text_size(px(14.0)).font_weight(gpui::FontWeight::SEMIBOLD).child(format!("{} · {}", b.strategy.underlying, b.strategy.name)))
                     .child(badge(if b.from_chain { "期權鏈實際報價 (mid)" } else { "合成 BS 定價" }, if b.from_chain { p.green } else { p.yellow }))
+                    .when_some(self.external.clone(), |d, l| d.child(badge(format!("來自函數工作室：{l}"), p.purple)))
                     .child(muted_text(format!("建立日 {created} · σ(PoP) {} · μ {}", pct(b.sigma), pct(b.drift)), cx)),
             )
             .child(kpis)

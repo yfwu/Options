@@ -145,4 +145,12 @@ pub fn apply(cx: &mut App) {
     t.chart_5 = p.cyan;
     t.window_border = p.border;
     t.overlay = gpui::black().opacity(0.4);
+    // code editor (Payoff Studio) colours
+    let mut ht = (*gpui_component::highlighter::HighlightTheme::default_dark()).clone();
+    ht.style.editor_background = Some(p.bg);
+    ht.style.editor_foreground = Some(p.text);
+    ht.style.editor_active_line = Some(p.surface);
+    ht.style.editor_line_number = Some(p.dim);
+    ht.style.editor_active_line_number = Some(p.muted);
+    t.highlight_theme = std::sync::Arc::new(ht);
 }
