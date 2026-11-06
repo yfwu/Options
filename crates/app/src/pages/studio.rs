@@ -13,9 +13,10 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     select::{Select, SelectEvent, SelectState},
+    slider::{Slider, SliderEvent, SliderState},
     v_flex, ActiveTheme, IndexPath, Sizable,
 };
-use optlab_core::payoff::{compile_book, examples, parse, price, value_curve, CompileOptions, Instrument, LegStyle, Market, PayoffStats, PricedPayoff, Replication, SyntheticMarket};
+use optlab_core::payoff::{compile_book, date_view, examples, DateView, parse, price, value_curve, CompileOptions, Instrument, LegStyle, Market, PayoffStats, PricedPayoff, Replication, SyntheticMarket};
 use optlab_core::strategy::{Leg, Strategy};
 use optlab_core::{OptionChain, OptionKind};
 use optlab_data::{bundled, presets};
@@ -23,7 +24,7 @@ use optlab_data::{bundled, presets};
 use crate::data_bridge;
 use crate::state::{AppEvent, AppState, StatusLevel};
 use crate::theme::{palette, MONO_FONT};
-use crate::widgets::charts::{fmt_auto, xy_chart, ChartSpec, RefLine, Series};
+use crate::widgets::charts::{fmt_auto, xy_chart, ChartSpec, RefLine, Series, SeriesKind};
 use crate::widgets::ui::*;
 
 const DEFAULT_SRC: &str = "2*bull(100%, 115%)";
@@ -89,6 +90,10 @@ struct Out {
     legs: Vec<(String, Vec<(f64, f64)>)>,
     /// Per priced leg: expiry label and date.
     leg_exp: Vec<(String, NaiveDate)>,
+    /// Market used for pricing (needed by the time slider).
+    mkt: Market,
+    /// Plotting grid for the date view.
+    xs: Vec<f64>,
 }
 
 struct Charts {
@@ -118,8 +123,19 @@ pub struct StudioPage {
     use_chain: bool,
     errors: FormErrors,
     error: Option<String>,
-    out: Option<Out>,
+    out: Option<Arc<Out>>,
     charts: Option<Charts>,
+    // --- time slider
+    day_slider: Entity<SliderState>,
+    iv_slider: Entity<SliderState>,
+    day: f64,
+    dvol: f64,
+    pnl_mode: bool,
+    view: Option<DateView>,
+    view_gen: u64,
+    playing: u64,
+    play_seq: u64,
+    _slider_subs: Vec<Subscription>,
     computing: bool,
     edit_gen: u64,
     comp_gen: u64,
@@ -238,7 +254,7 @@ fn run_job(job: Job) -> Result<Out, String> {
         })
         .collect();
     let _ = expiry;
-    Ok(Out { src: job.src, sym: job.sym, rep, priced, market_label: label, from_chain, created, lo, hi, target, repl, now, mid, legs, leg_exp })
+    Ok(Out { src: job.src, sym: job.sym, rep, priced, market_label: label, from_chain, created, lo, hi, target, repl, now, mid, legs, leg_exp, mkt, xs })
 }
 
 impl StudioPage {
@@ -293,13 +309,135 @@ impl StudioPage {
             edit_gen: 0,
             comp_gen: 0,
             _subs: subs,
+            day_slider: cx.new(|_| SliderState::new().min(0.0).max(1.0).step(1.0).default_value(0.0)),
+            iv_slider: cx.new(|_| SliderState::new().min(-20.0).max(20.0).step(0.5).default_value(0.0)),
+            day: 0.0,
+            dvol: 0.0,
+            pnl_mode: false,
+            view: None,
+            view_gen: 0,
+            playing: 0,
+            play_seq: 0,
+            _slider_subs: vec![],
         };
+        this.reset_sliders(1.0, cx);
         this.recompile(cx);
         this
     }
 
+    fn horizon_days(&self) -> f64 {
+        self.out.as_ref().map(|o| (o.priced.t * 365.0).round().max(1.0)).unwrap_or(1.0)
+    }
+
+    /// (Re)create the date slider for a new horizon (day back to 0; the IV shift is kept).
+    fn reset_sliders(&mut self, horizon: f64, cx: &mut Context<Self>) {
+        let h = horizon.max(1.0) as f32;
+        self.day_slider = cx.new(|_| SliderState::new().min(0.0).max(h).step(1.0).default_value(0.0));
+        self.day = 0.0;
+        self.playing = 0;
+        let mut subs = vec![cx.subscribe(&self.day_slider, |this, _, ev: &SliderEvent, cx| {
+            let SliderEvent::Change(v) = ev;
+            this.playing = 0;
+            this.day = v.start() as f64;
+            this.schedule_view(cx);
+        })];
+        if self._slider_subs.is_empty() || self._slider_subs.len() < 2 {
+            subs.push(cx.subscribe(&self.iv_slider, |this, _, ev: &SliderEvent, cx| {
+                let SliderEvent::Change(v) = ev;
+                this.playing = 0;
+                this.dvol = v.start() as f64;
+                this.schedule_view(cx);
+            }));
+        } else {
+            subs.push(self._slider_subs.remove(1));
+        }
+        self._slider_subs = subs;
+    }
+
+    fn set_day(&mut self, d: f64, window: &mut Window, cx: &mut Context<Self>) {
+        let d = d.clamp(0.0, self.horizon_days()).round();
+        self.day = d;
+        self.day_slider.update(cx, |s, cx| s.set_value(d as f32, window, cx));
+        self.schedule_view(cx);
+    }
+
+    fn set_dvol(&mut self, v: f64, window: &mut Window, cx: &mut Context<Self>) {
+        self.dvol = v;
+        self.iv_slider.update(cx, |s, cx| s.set_value(v as f32, window, cx));
+        self.schedule_view(cx);
+    }
+
+    /// Animate the date slider from the current day to the horizon (~3 s, 30 frames).
+    fn toggle_play(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.playing != 0 {
+            self.playing = 0;
+            cx.notify();
+            return;
+        }
+        self.play_seq += 1;
+        let token = self.play_seq;
+        self.playing = token;
+        let h = self.horizon_days();
+        let start = if self.day >= h { 0.0 } else { self.day };
+        cx.spawn_in(window, async move |this, cx| {
+            for i in 1..=30 {
+                cx.background_executor().timer(Duration::from_millis(100)).await;
+                let go = this
+                    .update_in(cx, |this, window, cx| {
+                        if this.playing != token {
+                            return false;
+                        }
+                        this.set_day(start + (h - start) * i as f64 / 30.0, window, cx);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !go {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                if this.playing == token {
+                    this.playing = 0;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Recompute the date view (background, stale results dropped).
+    fn schedule_view(&mut self, cx: &mut Context<Self>) {
+        let Some(out) = self.out.clone() else { return };
+        self.view_gen += 1;
+        let g = self.view_gen;
+        let (day, dv) = (self.day, self.dvol / 100.0);
+        let task = cx.background_executor().spawn(async move {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| date_view(&out.priced, &out.mkt, &out.xs, day, dv))).ok()
+        });
+        cx.spawn(async move |this, cx| {
+            let v = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.view_gen != g {
+                    return;
+                }
+                this.view = v;
+                this.rebuild_main();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn rebuild_main(&mut self) {
+        if let (Some(o), Some(ch)) = (self.out.as_ref(), self.charts.as_mut()) {
+            ch.main = Self::main_chart(o, self.view.as_ref(), self.pnl_mode, self.day, self.dvol);
+        }
+    }
+
     /// Debounced recompile.
     fn schedule(&mut self, cx: &mut Context<Self>) {
+        self.playing = 0;
         self.edit_gen += 1;
         let g = self.edit_gen;
         cx.spawn(async move |this, cx| {
@@ -367,9 +505,14 @@ impl StudioPage {
                 this.computing = false;
                 match res {
                     Ok(out) => {
-                        this.charts = Some(Self::make_charts(&out));
+                        let out = Arc::new(out);
+                        this.charts = Some(Self::make_charts(&out, this.pnl_mode, this.dvol));
                         this.out = Some(out);
                         this.error = None;
+                        this.view = None;
+                        let h = this.horizon_days();
+                        this.reset_sliders(h, cx);
+                        this.schedule_view(cx);
                     }
                     Err(e) => this.error = Some(e),
                 }
@@ -380,22 +523,45 @@ impl StudioPage {
         cx.notify();
     }
 
-    fn make_charts(o: &Out) -> Charts {
+    fn main_chart(o: &Out, view: Option<&DateView>, pnl: bool, day: f64, dvol: f64) -> Rc<ChartSpec> {
         let p = palette();
         let pr = &o.priced;
-        let fin = |v: &[(f64, f64)]| -> Vec<(f64, f64)> { v.iter().copied().filter(|(_, y)| y.is_finite()).collect() };
+        let fin = |v: &[(f64, f64)], shift: f64| -> Vec<(f64, f64)> { v.iter().copied().filter(|(_, y)| y.is_finite()).map(|(x, y)| (x, y - shift)).collect() };
         let grow = (pr.r * pr.t).exp();
         let cost_ref = pr.price_mid * grow;
+        // in P&L mode every curve is shown net of the cost grown to its own date
+        let (s_h, s_now, s_mid) = if pnl { (cost_ref, pr.price_mid, pr.price_mid * (pr.r * pr.t / 2.0).exp()) } else { (0.0, 0.0, 0.0) };
+        let moved = day > 0.0 || dvol.abs() > 1e-9;
+        let dim = |c: Hsla| if moved { c.opacity(0.4) } else { c };
         let mut main = ChartSpec::new()
             .x_fmt(fmt_auto)
             .x_range(o.lo, o.hi)
             .min_left(CHART_LEFT)
-            .series(Series::line(if pr.multi_expiry { format!("目標 @ {:.0} 天", pr.horizon_days) } else { "目標 f(S)".to_string() }, fin(&o.target), p.blue).width(2.6))
-            .series(Series::line(if pr.multi_expiry { format!("複製部位 @ {:.0} 天", pr.horizon_days) } else { "複製 g(S) 到期".to_string() }, fin(&o.repl), p.orange).width(1.4).dashed())
-            .series(Series::line("今日價值", fin(&o.now), p.yellow).width(1.3))
-            .series(Series::line("半途價值 (t/2)", fin(&o.mid), p.purple).width(1.1))
-            .hline(RefLine::new(cost_ref, p.red).label(format!("損益平衡線 成本×e^rT = {cost_ref:.2}")))
+            .series(Series::line(if pr.multi_expiry { format!("目標 @ {:.0} 天", pr.horizon_days) } else { "目標 f(S)".to_string() }, fin(&o.target, s_h), dim(p.blue)).width(2.4))
+            .series(Series::line(if pr.multi_expiry { format!("複製部位 @ {:.0} 天", pr.horizon_days) } else { "複製 g(S) 到期".to_string() }, fin(&o.repl, s_h), dim(p.orange)).width(1.3).dashed())
+            .series(Series::line("今日價值", fin(&o.now, s_now), dim(p.yellow)).width(1.2))
+            .series(Series::line("半途價值 (t/2)", fin(&o.mid, s_mid), dim(p.purple)).width(1.0))
             .vline(RefLine::new(pr.spot, p.green).label(format!("現價 {:.2}", pr.spot)));
+        if pnl {
+            main = main.hline(RefLine::new(0.0, p.red).solid().label("損益 0"));
+        } else {
+            main = main.hline(RefLine::new(cost_ref, p.red).label(format!("損益平衡線 成本×e^rT = {cost_ref:.2}")));
+        }
+        if let Some(v) = view {
+            let pts: Vec<(f64, f64)> = v.curve.iter().filter(|c| c.1.is_finite()).map(|c| (c.0, if pnl { c.2 } else { c.1 })).collect();
+            let label = if v.elapsed_days <= 0.0 { "選定日期：今天".to_string() } else { format!("選定日期：第 {:.0} 天", v.elapsed_days) };
+            let label = if v.vol_shift.abs() > 1e-9 { format!("{label} · IV {:+.1} 點", v.vol_shift * 100.0) } else { label };
+            main = main.series(Series::line(label, pts, p.cyan).width(3.0));
+            let y = if pnl { v.pnl_at_spot } else { v.value_at_spot };
+            if y.is_finite() {
+                main = main.series(Series { kind: SeriesKind::Points { radius: 5.0 }, ..Series::points(format!("現價處 {y:.2}"), vec![(pr.spot, y)], p.cyan) });
+            }
+            for b in &v.breakevens {
+                if moved {
+                    main = main.vline(RefLine::new(*b, p.cyan.opacity(0.7)).label(format!("BE {b:.2}")));
+                }
+            }
+        }
         if o.rep.kinks.len() <= 25 {
             for k in &o.rep.kinks {
                 if *k > o.lo && *k < o.hi {
@@ -403,9 +569,19 @@ impl StudioPage {
                 }
             }
         }
-        for b in &pr.breakevens {
-            main = main.vline(RefLine::new(*b, p.red).label(format!("BE {b:.2}")));
+        if !moved {
+            for b in &pr.breakevens {
+                main = main.vline(RefLine::new(*b, p.red).label(format!("BE {b:.2}")));
+            }
         }
+        main.into_rc()
+    }
+
+    fn make_charts(o: &Out, pnl: bool, dvol: f64) -> Charts {
+        let p = palette();
+        let pr = &o.priced;
+        let fin = |v: &[(f64, f64)]| -> Vec<(f64, f64)> { v.iter().copied().filter(|(_, y)| y.is_finite()).collect() };
+        let main = Self::main_chart(o, None, pnl, 0.0, dvol);
         // densities as probability per 1% of spot
         let scale = pr.spot * 0.01;
         let dq: Vec<(f64, f64)> = pr.density.iter().filter(|d| d.0 >= o.lo && d.0 <= o.hi).map(|d| (d.0, d.1 * scale)).collect();
@@ -432,7 +608,7 @@ impl StudioPage {
             decomp = decomp.series(sr);
         }
         decomp = decomp.series(Series::line("合計 g(S)", fin(&o.repl), p.text).width(2.2)).hline(RefLine::new(0.0, p.dim).solid());
-        Charts { main: main.into_rc(), density: density.into_rc(), decomp: decomp.into_rc() }
+        Charts { main, density: density.into_rc(), decomp: decomp.into_rc() }
     }
 
     fn load_example(&mut self, src: &'static str, window: &mut Window, cx: &mut Context<Self>) {
@@ -612,9 +788,79 @@ impl StudioPage {
             .when_some(self.out.as_ref().map(|o| o.market_label.clone()), |d, l| d.child(muted_text(l, cx)))
     }
 
+    fn render_time(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette();
+        let h = self.horizon_days();
+        let Some(o) = self.out.as_ref() else { return div().into_any_element() };
+        let date = o.created + chrono::Duration::days(self.day.round() as i64);
+        let day_label = format!("第 {:.0} 天 · {date}（距最早到期 {:.0} 天）", self.day, (h - self.day).max(0.0));
+        let quick = [("今天", 0.0), ("1/4", 0.25), ("1/2", 0.5), ("3/4", 0.75), ("到期", 1.0)];
+        let mut kpis = h_flex().gap_1p5().flex_wrap();
+        if let Some(v) = &self.view {
+            let u = o.priced.units;
+            let g = v.greeks;
+            let day0 = v.elapsed_days <= 0.0;
+            // on day 0 without an IV shift the P&L is identically ~0 at spot: crossings are noise
+            let be = if v.breakevens.is_empty() || (day0 && v.vol_shift == 0.0) {
+                "—".to_string()
+            } else {
+                v.breakevens.iter().map(|b| format!("{b:.1}")).collect::<Vec<_>>().join(" / ")
+            };
+            kpis = kpis
+                .child(kpi_sm("價值@現價 ×單位", money(v.value_at_spot * u), None, cx).min_w(px(104.0)))
+                .child(kpi_sm("損益@現價 ×單位", money(v.pnl_at_spot * u), Some(sign_color(v.pnl_at_spot)), cx).min_w(px(104.0)))
+                .child(kpi_sm("Δ 股", f1(g.delta * u), None, cx).min_w(px(104.0)))
+                .child(kpi_sm("Γ", f3(g.gamma * u), None, cx).min_w(px(104.0)))
+                .child(kpi_sm("Θ $/天", f2(g.theta * u), Some(sign_color(g.theta)), cx).min_w(px(104.0)))
+                .child(kpi_sm("Vega $/點", f2(g.vega * u), None, cx).min_w(px(104.0)))
+                .child(kpi_sm("獲利機率 P / Q", if day0 { "—".to_string() } else { format!("{} / {}", pct(v.prob_profit_p), pct(v.prob_profit_q)) }, None, cx).min_w(px(104.0)))
+                .child(kpi_sm("期望損益 P", if day0 { "—".to_string() } else { money(v.expected_pnl_p * u) }, if day0 { None } else { Some(sign_color(v.expected_pnl_p)) }, cx).min_w(px(104.0)))
+                .child(kpi_sm("損益兩平", be, Some(p.orange), cx));
+        }
+        panel_with(
+            "時間 & 波動率情境 · 任一日期的組合價值",
+            div().text_size(px(10.5)).text_color(p.dim).child("範圍：今天 → 最早到期日（之後的價值取決於路徑）"),
+            cx,
+        )
+        .child(
+            v_flex()
+                .p_2()
+                .gap_1p5()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .flex_wrap()
+                        .child(div().flex_1().min_w(px(240.0)).text_size(px(12.0)).font_family(MONO_FONT).text_color(p.cyan).child(day_label))
+                        .child(h_flex().gap_1().children(quick.iter().map(|(l, f)| {
+                            let f = *f;
+                            chip(SharedString::from(format!("q-{l}")), *l, (self.day - (h * f).round()).abs() < 0.5, cx).on_click(cx.listener(move |this, _, window, cx| {
+                                this.playing = 0;
+                                let h = this.horizon_days();
+                                this.set_day(h * f, window, cx);
+                            }))
+                        })))
+                        .child(chip("play", if self.playing != 0 { "■ 停止" } else { "▶ 播放" }, self.playing != 0, cx).on_click(cx.listener(|this, _, window, cx| this.toggle_play(window, cx)))),
+                )
+                .child(div().px_1().child(Slider::new(&self.day_slider)))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(div().w(px(170.0)).flex_none().text_size(px(12.0)).font_family(MONO_FONT).text_color(if self.dvol.abs() > 1e-9 { p.yellow } else { p.muted }).child(format!("IV 變動 {:+.1} 點", self.dvol)))
+                        .child(div().flex_1().min_w(px(100.0)).child(Slider::new(&self.iv_slider)))
+                        .child(chip("iv-reset", "IV 歸零", false, cx).on_click(cx.listener(|this, _, window, cx| {
+                            this.playing = 0;
+                            this.set_dvol(0.0, window, cx);
+                        }))),
+                )
+                .child(kpis),
+        )
+        .into_any_element()
+    }
+
     fn render_middle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let controls = self.render_controls(cx);
-        let mut col = v_flex().gap_2().child(controls);
+        let time = self.render_time(cx);
+        let mut col = v_flex().gap_2().child(controls).child(time);
         let multi = self.out.as_ref().filter(|o| o.priced.multi_expiry).map(|o| o.priced.horizon_days);
         let (t_main, t_dens, t_dec) = match multi {
             Some(h) => (
@@ -631,7 +877,24 @@ impl StudioPage {
         match &self.charts {
             Some(ch) => {
                 col = col
-                    .child(panel(t_main, cx).h(px(360.0)).child(div().flex_1().min_h_0().p_1().child(xy_chart(ch.main.clone()))))
+                    .child(
+                        panel_with(
+                            if self.pnl_mode { format!("{t_main} · 顯示損益（= 價值 − 成本×e^rt）") } else { t_main },
+                            h_flex()
+                                .gap_1()
+                                .child(chip("y-val", "價值", !self.pnl_mode, cx).on_click(cx.listener(|this, _, _, cx| {
+                                    this.pnl_mode = false;
+                                    this.rebuild_main();
+                                    cx.notify();
+                                })))
+                                .child(chip("y-pnl", "損益", self.pnl_mode, cx).on_click(cx.listener(|this, _, _, cx| {
+                                    this.pnl_mode = true;
+                                    this.rebuild_main();
+                                    cx.notify();
+                                }))),
+                            cx,
+                        )
+                        .h(px(360.0)).child(div().flex_1().min_h_0().p_1().child(xy_chart(ch.main.clone()))))
                     .child(panel(t_dens, cx).h(px(170.0)).child(div().flex_1().min_h_0().p_1().child(xy_chart(ch.density.clone()))))
                     .child(panel(t_dec, cx).h(px(230.0)).child(div().flex_1().min_h_0().p_1().child(xy_chart(ch.decomp.clone()))));
             }
