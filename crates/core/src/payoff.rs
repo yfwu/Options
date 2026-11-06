@@ -1352,7 +1352,12 @@ impl PricedLeg {
     /// Value at time `elapsed` (years from now) when the underlying is `x`; options are
     /// revalued with their pricing IV (sticky strike), expired legs pay intrinsic value.
     pub fn value_at(&self, x: f64, elapsed: f64, r: f64, q: f64) -> f64 {
+        self.value_at_iv(x, elapsed, r, q, 0.0)
+    }
+    /// Like [`PricedLeg::value_at`] with every option's IV shifted by `dvol` (0.05 = +5 vol pts).
+    pub fn value_at_iv(&self, x: f64, elapsed: f64, r: f64, q: f64, dvol: f64) -> f64 {
         let rem = self.t - elapsed;
+        let iv = (self.iv + dvol).max(0.01);
         let l = self.leg;
         l.qty
             * match l.instrument {
@@ -1362,14 +1367,14 @@ impl PricedLeg {
                     if rem <= 1e-9 {
                         (x - k).max(0.0)
                     } else {
-                        bs_price(OptionKind::Call, x, k, rem, r, q, self.iv)
+                        bs_price(OptionKind::Call, x, k, rem, r, q, iv)
                     }
                 }
                 Instrument::Put(k) => {
                     if rem <= 1e-9 {
                         (k - x).max(0.0)
                     } else {
-                        bs_price(OptionKind::Put, x, k, rem, r, q, self.iv)
+                        bs_price(OptionKind::Put, x, k, rem, r, q, iv)
                     }
                 }
             }
@@ -1498,30 +1503,7 @@ pub fn price(prog: &Program, rep: &Replication, mkt: &Market, units: f64, mu: f6
     let df_h = (-r * h).exp();
 
     let (xs, qd, hk) = mkt.density(h);
-    // real-world: Esscher tilt q·(S/F)^θ so that E_P[S] = F·e^{(μ − (r − q))H}
-    let fwd = s * ((r - q) * h).exp();
-    let target_mean = fwd * ((mu - (r - q)) * h).exp();
-    let tilt = |th: f64| -> Vec<f64> {
-        let mut p: Vec<f64> = xs.iter().zip(&qd).map(|(x, v)| v * (x / fwd).powf(th)).collect();
-        let m: f64 = p.iter().sum::<f64>() * hk;
-        if m > 0.0 {
-            for v in &mut p {
-                *v /= m;
-            }
-        }
-        p
-    };
-    let mean_of = |p: &[f64]| xs.iter().zip(p).map(|(x, v)| x * v).sum::<f64>() * hk;
-    let (mut a, mut b) = (-20.0, 20.0);
-    for _ in 0..80 {
-        let mid = 0.5 * (a + b);
-        if mean_of(&tilt(mid)) < target_mean {
-            a = mid;
-        } else {
-            b = mid;
-        }
-    }
-    let pd = tilt(0.5 * (a + b));
+    let pd = real_world_density(&xs, &qd, hk, s, r, q, mu, h);
 
     let mut priced = PricedPayoff {
         legs,
@@ -1596,6 +1578,140 @@ pub fn price(prog: &Program, rep: &Replication, mkt: &Market, units: f64, mu: f6
     priced.breakevens = bes;
     priced.density = xs.iter().zip(qd.iter().zip(&pd)).step_by(10).map(|(x, (a, b))| (*x, *a, *b)).collect();
     priced
+}
+
+/// Real-world density by Esscher tilt `q·(S/F)^θ`, θ chosen so that
+/// `E_P[S_t] = F_t·e^{(μ − (r − q))t}`.
+#[allow(clippy::too_many_arguments)]
+fn real_world_density(xs: &[f64], qd: &[f64], hk: f64, s: f64, r: f64, q: f64, mu: f64, t: f64) -> Vec<f64> {
+    let fwd = s * ((r - q) * t).exp();
+    let target_mean = fwd * ((mu - (r - q)) * t).exp();
+    let tilt = |th: f64| -> Vec<f64> {
+        let mut p: Vec<f64> = xs.iter().zip(qd).map(|(x, v)| v * (x / fwd).powf(th)).collect();
+        let m: f64 = p.iter().sum::<f64>() * hk;
+        if m > 0.0 {
+            for v in &mut p {
+                *v /= m;
+            }
+        }
+        p
+    };
+    let mean_of = |p: &[f64]| xs.iter().zip(p).map(|(x, v)| x * v).sum::<f64>() * hk;
+    let (mut a, mut b) = (-20.0, 20.0);
+    for _ in 0..80 {
+        let mid = 0.5 * (a + b);
+        if mean_of(&tilt(mid)) < target_mean {
+            a = mid;
+        } else {
+            b = mid;
+        }
+    }
+    tilt(0.5 * (a + b))
+}
+
+/// Snapshot of the book on a chosen future date (the "time slider").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DateView {
+    /// Years from today (clamped to [0, horizon]).
+    pub elapsed: f64,
+    pub elapsed_days: f64,
+    /// Days left until the horizon (earliest expiry).
+    pub days_to_horizon: f64,
+    /// IV shift applied to every option (decimal).
+    pub vol_shift: f64,
+    /// Cost grown at the risk-free rate to this date (per unit).
+    pub cost_fv: f64,
+    /// Book value per unit at today's spot on that date.
+    pub value_at_spot: f64,
+    /// value_at_spot − cost_fv.
+    pub pnl_at_spot: f64,
+    /// Greeks per unit at today's spot on that date (with the IV shift).
+    pub greeks: Greeks,
+    /// (S, value, P&L) over the plotting range.
+    pub curve: Vec<(f64, f64, f64)>,
+    /// P&L zero crossings on that date.
+    pub breakevens: Vec<f64>,
+    /// Probability that S on that date gives a profit: risk-neutral / real-world.
+    pub prob_profit_q: f64,
+    pub prob_profit_p: f64,
+    /// Expected P&L on that date under Q / P.
+    pub expected_pnl_q: f64,
+    pub expected_pnl_p: f64,
+}
+
+/// Value the book on a date `elapsed_days` from today with all option IVs shifted by
+/// `vol_shift`. `spots` is the plotting grid; probabilities use the smile density of S on
+/// that date (and the Esscher-tilted real-world density with the book's μ).
+pub fn date_view(priced: &PricedPayoff, mkt: &Market, spots: &[f64], elapsed_days: f64, vol_shift: f64) -> DateView {
+    let (r, q, s) = (priced.r, priced.q, priced.spot);
+    let elapsed = (elapsed_days / 365.0).clamp(0.0, priced.t);
+    let val = |x: f64| -> f64 { priced.legs.iter().map(|l| l.value_at_iv(x, elapsed, r, q, vol_shift)).sum() };
+    let cost_fv = priced.price_mid * (r * elapsed).exp();
+    let curve: Vec<(f64, f64, f64)> = spots.iter().map(|&x| {
+        let v = val(x);
+        (x, v, v - cost_fv)
+    }).collect();
+    let mut breakevens = Vec::new();
+    for w in curve.windows(2) {
+        let (a, b) = (w[0].2, w[1].2);
+        if a.signum() != b.signum() && b != 0.0 {
+            breakevens.push(w[0].0 + (w[1].0 - w[0].0) * a.abs() / (a.abs() + b.abs()));
+        }
+    }
+    // Greeks at today's spot on that date
+    let mut g = Greeks::default();
+    for l in &priced.legs {
+        let rem = l.t - elapsed;
+        let leg = l.leg;
+        let gk = match leg.instrument {
+            Instrument::Cash => Greeks { price: (-r * rem.max(0.0)).exp(), ..Default::default() },
+            Instrument::Stock => Greeks { price: s * (-q * rem.max(0.0)).exp(), delta: (-q * rem.max(0.0)).exp(), ..Default::default() },
+            Instrument::Call(k) | Instrument::Put(k) => {
+                let kind = if matches!(leg.instrument, Instrument::Call(_)) { OptionKind::Call } else { OptionKind::Put };
+                bs_greeks(kind, s, k, rem.max(0.0), r, q, (l.iv + vol_shift).max(0.01))
+            }
+        };
+        g = g + gk * leg.qty;
+    }
+    let value_at_spot = val(s);
+    g.price = value_at_spot;
+    // probabilities on that date
+    let (mut pq, mut pp, mut eq, mut ep) = (0.0, 0.0, 0.0, 0.0);
+    if elapsed > 0.5 / 365.0 {
+        let (xs, qd, hk) = mkt.density(elapsed);
+        let pd = real_world_density(&xs, &qd, hk, s, r, q, priced.mu, elapsed);
+        for ((x, a), b) in xs.iter().zip(&qd).zip(&pd) {
+            let pnl = val(*x) - cost_fv;
+            if pnl > 0.0 {
+                pq += a * hk;
+                pp += b * hk;
+            }
+            eq += pnl * a * hk;
+            ep += pnl * b * hk;
+        }
+    } else {
+        let pnl = value_at_spot - cost_fv;
+        pq = if pnl > 0.0 { 1.0 } else { 0.0 };
+        pp = pq;
+        eq = pnl;
+        ep = pnl;
+    }
+    DateView {
+        elapsed,
+        elapsed_days: (elapsed * 365.0).round(),
+        days_to_horizon: ((priced.t - elapsed) * 365.0).round().max(0.0),
+        vol_shift,
+        cost_fv,
+        value_at_spot,
+        pnl_at_spot: value_at_spot - cost_fv,
+        greeks: g,
+        curve,
+        breakevens,
+        prob_profit_q: pq,
+        prob_profit_p: pp,
+        expected_pnl_q: eq,
+        expected_pnl_p: ep,
+    }
 }
 
 /// Value of the book as a function of the spot when `t_remaining` years are left until the
@@ -1904,6 +2020,49 @@ mod tests {
         fn mkt() -> SyntheticMarket {
             SyntheticMarket { long_iv: 0.24, ..SyntheticMarket::new(600.0, 1.0, 0.04, 0.006, 0.22) }
         }
+    }
+
+    #[test]
+    fn date_view_slides_from_today_to_expiry() {
+        let mkt = Market::Synthetic(SyntheticMarket { skew: 0.0, curv: 0.0, ..SyntheticMarket::new(600.0, 0.5, 0.04, 0.0, 0.2) });
+        let pr = p("call(600)");
+        let rep = compile_book(&pr, 182.0, &|_| CompileOptions::free(600.0)).unwrap();
+        let px = price(&pr, &rep, &mkt, 100.0, 0.08);
+        let spots: Vec<f64> = (0..=100).map(|i| 400.0 + 4.0 * i as f64).collect();
+        // today: value at spot = price, P&L 0, greeks = pricing greeks
+        let d0 = date_view(&px, &mkt, &spots, 0.0, 0.0);
+        assert!((d0.value_at_spot - px.price_mid).abs() < 1e-9);
+        assert!(d0.pnl_at_spot.abs() < 1e-9);
+        assert!((d0.greeks.delta - px.greeks.delta).abs() < 1e-9);
+        // at expiry: intrinsic curve; slider is clamped to the horizon
+        let d1 = date_view(&px, &mkt, &spots, 9999.0, 0.0);
+        assert!((d1.elapsed - px.t).abs() < 1e-12 && d1.days_to_horizon == 0.0);
+        let at = |d: &DateView, x: f64| d.curve.iter().find(|c| (c.0 - x).abs() < 1e-9).unwrap().1;
+        assert!((at(&d1, 700.0) - 100.0).abs() < 1e-9 && at(&d1, 500.0).abs() < 1e-9);
+        // midway: time decay lowers the ATM value, theta is negative
+        let dm = date_view(&px, &mkt, &spots, 91.0, 0.0);
+        assert!(dm.value_at_spot < d0.value_at_spot && dm.greeks.theta < 0.0);
+        assert!(dm.prob_profit_q > 0.0 && dm.prob_profit_q < 1.0);
+        // risk-neutral expected P&L ≈ 0 on any date (consistent smile & cost carry)
+        assert!(dm.expected_pnl_q.abs() < 0.05 * px.price_mid, "{}", dm.expected_pnl_q);
+        // IV shift: +5 vol pts raises a long option's value by ≈ vega × 5
+        let dv = date_view(&px, &mkt, &spots, 0.0, 0.05);
+        assert!((dv.value_at_spot - d0.value_at_spot - 5.0 * px.greeks.vega).abs() < 0.2, "{} vs {}", dv.value_at_spot - d0.value_at_spot, 5.0 * px.greeks.vega);
+    }
+
+    #[test]
+    fn date_view_on_a_calendar_shows_time_decay_profit() {
+        let mkt = Market::Synthetic(SyntheticMarket { skew: 0.0, curv: 0.0, ..SyntheticMarket::new(600.0, 30.0 / 365.0, 0.04, 0.0, 0.2) });
+        let pr = p("call(600) @ 90 - call(600) @ 30");
+        let rep = compile_book(&pr, 30.0, &|_| CompileOptions::free(600.0)).unwrap();
+        let px = price(&pr, &rep, &mkt, 100.0, 0.08);
+        let spots = [600.0];
+        let d0 = date_view(&px, &mkt, &spots, 0.0, 0.0);
+        let d20 = date_view(&px, &mkt, &spots, 20.0, 0.0);
+        // a calendar is long theta: at an unchanged spot it gains as the front month decays
+        assert!(d0.greeks.theta > 0.0);
+        assert!(d20.pnl_at_spot > 0.0, "{}", d20.pnl_at_spot);
+        assert!(d20.days_to_horizon == 10.0);
     }
 
 }

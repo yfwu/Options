@@ -281,6 +281,12 @@ enum Cmd {
         /// Write S, target f(S), replicated g(S) and today's value to CSV.
         #[arg(long)]
         csv: Option<std::path::PathBuf>,
+        /// Time slider: value the book on these days from today (comma separated, e.g. 0,15,30).
+        #[arg(long)]
+        at: Option<String>,
+        /// IV shift in vol points for --at (e.g. -5 for a vol crush).
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        vol_shift: f64,
     },
     /// List strategy templates, or analyse one on a synthetic market.
     Strategies {
@@ -630,8 +636,8 @@ fn main() -> Result<()> {
                 print_strategy(&s, &MarketParams::new(chain.spot, r, q), a.surface.iv(chain.spot, 1.0).unwrap_or(0.2));
             }
         }
-        Cmd::Payoff { expr, file, examples, symbol, spot, iv, days, rate, div, skew, units, mu, style, step, chain_file, provider, csv } => {
-            run_payoff(PayoffArgs { expr, file, examples, symbol, spot, iv, days, rate, div, skew, units, mu, style, step, chain_file, provider, csv })?;
+        Cmd::Payoff { expr, file, examples, symbol, spot, iv, days, rate, div, skew, units, mu, style, step, chain_file, provider, csv, at, vol_shift } => {
+            run_payoff(PayoffArgs { expr, file, examples, symbol, spot, iv, days, rate, div, skew, units, mu, style, step, chain_file, provider, csv, at, vol_shift })?;
         }
         Cmd::Strategies { template, spot, iv, rate, div } => match template {
             None => {
@@ -694,10 +700,12 @@ struct PayoffArgs {
     chain_file: Option<std::path::PathBuf>,
     provider: Option<String>,
     csv: Option<std::path::PathBuf>,
+    at: Option<String>,
+    vol_shift: f64,
 }
 
 fn run_payoff(a: PayoffArgs) -> Result<()> {
-    use optlab_core::payoff::{compile_book, examples, parse, price, value_curve, CompileOptions, Instrument, LegStyle, Market, StrikeGrid, SyntheticMarket};
+    use optlab_core::payoff::{compile_book, date_view, examples, parse, price, value_curve, CompileOptions, Instrument, LegStyle, Market, StrikeGrid, SyntheticMarket};
     if a.examples {
         println!("Payoff 語言：S = 到期價格，spot = 現價，110% = 1.10×spot；+ - * / ^；變數 a = 600；以 ; 或換行分隔");
         println!("基本元件：call(K) put(K) digital(K) digitalput(K) pwl(x1,y1,x2,y2,…)");
@@ -830,6 +838,40 @@ fn run_payoff(a: PayoffArgs) -> Result<()> {
     }
     if !px.breakevens.is_empty() {
         println!("到期損益兩平：{:?}", px.breakevens.iter().map(|b| (b * 100.0).round() / 100.0).collect::<Vec<_>>());
+    }
+    if let Some(list) = &a.at {
+        let days: Vec<f64> = list.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if days.is_empty() {
+            bail!("--at 需要天數，例如 --at 0,15,30");
+        }
+        let grid: Vec<f64> = [0.8, 0.9, 0.95, 1.0, 1.05, 1.1, 1.2].iter().map(|m| spot * m).collect();
+        println!(
+            "\n時間滑桿（IV 變動 {:+.1} 點；最遠可看到最早到期日 {} 天；每單位損益）",
+            a.vol_shift,
+            px.horizon_days
+        );
+        print!("{:>6} {:>10} {:>10} {:>8} {:>9} {:>8} {:>9}", "天數", "價值@現價", "損益@現價", "Δ", "Θ/天", "Vega", "獲利機率");
+        for x in &grid {
+            print!(" {:>9}", format!("S={:.0}", x));
+        }
+        println!();
+        for d in days {
+            let v = date_view(&px, &mkt, &grid, d, a.vol_shift / 100.0);
+            print!(
+                "{:>6.0} {:>10.3} {:>10.3} {:>8.3} {:>9.4} {:>8.4} {:>9}",
+                v.elapsed_days,
+                v.value_at_spot,
+                v.pnl_at_spot,
+                v.greeks.delta,
+                v.greeks.theta,
+                v.greeks.vega,
+                if v.elapsed_days < 1.0 { "-".to_string() } else { format!("{:.1}%", v.prob_profit_p * 100.0) }
+            );
+            for c in &v.curve {
+                print!(" {:>9.2}", c.2);
+            }
+            println!();
+        }
     }
     if let Some(p) = a.csv {
         let n = 240;
