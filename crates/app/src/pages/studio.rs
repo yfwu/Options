@@ -16,7 +16,7 @@ use gpui_component::{
     slider::{Slider, SliderEvent, SliderState},
     v_flex, ActiveTheme, IndexPath, Sizable,
 };
-use optlab_core::payoff::{compile_book, date_view, examples, DateView, parse, price, value_curve, CompileOptions, Instrument, LegStyle, Market, PayoffStats, PricedPayoff, Replication, SyntheticMarket};
+use optlab_core::payoff::{compile_book, date_view_scenario, examples, DateView, VolScenario, parse, price, value_curve, CompileOptions, Instrument, LegStyle, Market, PayoffStats, PricedPayoff, Replication, SyntheticMarket};
 use optlab_core::strategy::{Leg, Strategy};
 use optlab_core::{OptionChain, OptionKind};
 use optlab_data::{bundled, presets};
@@ -130,6 +130,13 @@ pub struct StudioPage {
     iv_slider: Entity<SliderState>,
     day: f64,
     dvol: f64,
+    /// Per option expiry: (days, years, slider) and shift in vol points (on top of `dvol`).
+    exp_sliders: Vec<(f64, f64, Entity<SliderState>)>,
+    exp_shifts: Vec<f64>,
+    linked: bool,
+    /// Slider thumbs must be re-synced from `dvol` / `exp_shifts` at the next render.
+    slider_sync: bool,
+    _exp_subs: Vec<Subscription>,
     pnl_mode: bool,
     view: Option<DateView>,
     view_gen: u64,
@@ -313,6 +320,11 @@ impl StudioPage {
             iv_slider: cx.new(|_| SliderState::new().min(-20.0).max(20.0).step(0.5).default_value(0.0)),
             day: 0.0,
             dvol: 0.0,
+            exp_sliders: vec![],
+            exp_shifts: vec![],
+            linked: false,
+            slider_sync: false,
+            _exp_subs: vec![],
             pnl_mode: false,
             view: None,
             view_gen: 0,
@@ -361,12 +373,6 @@ impl StudioPage {
         self.schedule_view(cx);
     }
 
-    fn set_dvol(&mut self, v: f64, window: &mut Window, cx: &mut Context<Self>) {
-        self.dvol = v;
-        self.iv_slider.update(cx, |s, cx| s.set_value(v as f32, window, cx));
-        self.schedule_view(cx);
-    }
-
     /// Animate the date slider from the current day to the horizon (~3 s, 30 frames).
     fn toggle_play(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.playing != 0 {
@@ -411,9 +417,10 @@ impl StudioPage {
         let Some(out) = self.out.clone() else { return };
         self.view_gen += 1;
         let g = self.view_gen;
-        let (day, dv) = (self.day, self.dvol / 100.0);
+        let day = self.day;
+        let sc = self.scenario();
         let task = cx.background_executor().spawn(async move {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| date_view(&out.priced, &out.mkt, &out.xs, day, dv))).ok()
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| date_view_scenario(&out.priced, &out.mkt, &out.xs, day, &sc))).ok()
         });
         cx.spawn(async move |this, cx| {
             let v = task.await;
@@ -430,8 +437,85 @@ impl StudioPage {
     }
 
     fn rebuild_main(&mut self) {
+        let iv = if self.iv_moved() { 1.0 } else { 0.0 };
         if let (Some(o), Some(ch)) = (self.out.as_ref(), self.charts.as_mut()) {
-            ch.main = Self::main_chart(o, self.view.as_ref(), self.pnl_mode, self.day, self.dvol);
+            ch.main = Self::main_chart(o, self.view.as_ref(), self.pnl_mode, self.day, iv);
+        }
+    }
+
+    fn iv_moved(&self) -> bool {
+        self.dvol.abs() > 1e-9 || self.exp_shifts.iter().any(|x| x.abs() > 1e-9)
+    }
+
+    /// Current IV scenario: parallel + one shift per option expiry (decimals).
+    fn scenario(&self) -> VolScenario {
+        VolScenario {
+            parallel: self.dvol / 100.0,
+            term: self.exp_sliders.iter().zip(&self.exp_shifts).map(|((_, t, _), x)| (*t, *x / 100.0)).collect(),
+        }
+    }
+
+    /// Rebuild the per-expiry sliders for the book's option expiries (only with 2+).
+    fn rebuild_exp_sliders(&mut self, cx: &mut Context<Self>) {
+        let ex: Vec<(f64, f64)> = self.out.as_ref().map(|o| o.priced.expiries()).unwrap_or_default();
+        let ex: Vec<(f64, f64)> = if ex.len() >= 2 { ex } else { vec![] };
+        let same = ex.len() == self.exp_sliders.len() && ex.iter().zip(&self.exp_sliders).all(|(a, b)| (a.0 - b.0).abs() < 0.5);
+        if same {
+            // keep values, refresh the year fractions
+            for (e, s) in ex.iter().zip(self.exp_sliders.iter_mut()) {
+                s.1 = e.1;
+            }
+            return;
+        }
+        self.exp_shifts = vec![0.0; ex.len()];
+        self.exp_sliders.clear();
+        self._exp_subs.clear();
+        for (i, (d, t)) in ex.into_iter().enumerate() {
+            let sl = cx.new(|_| SliderState::new().min(-20.0).max(20.0).step(0.5).default_value(0.0));
+            self._exp_subs.push(cx.subscribe(&sl, move |this, _, ev: &SliderEvent, cx| {
+                let SliderEvent::Change(v) = ev;
+                let v = v.start() as f64;
+                this.playing = 0;
+                if this.linked {
+                    for x in this.exp_shifts.iter_mut() {
+                        *x = v;
+                    }
+                    this.slider_sync = true;
+                } else if let Some(x) = this.exp_shifts.get_mut(i) {
+                    *x = v;
+                }
+                this.schedule_view(cx);
+                cx.notify();
+            }));
+            self.exp_sliders.push((d, t, sl));
+        }
+    }
+
+    /// Apply a scenario preset (`near`/`far` in vol points; `parallel` added on top).
+    fn apply_preset(&mut self, parallel: f64, near: f64, far: f64, window: &mut Window, cx: &mut Context<Self>) {
+        self.playing = 0;
+        match (self.out.as_ref(), self.exp_sliders.len()) {
+            (Some(o), n) if n >= 2 => {
+                let sc = VolScenario::near_far(&o.priced, near / 100.0, far / 100.0);
+                self.exp_shifts = self.exp_sliders.iter().map(|(_, t, _)| ((sc.shift_for(*t) * 100.0) * 2.0).round() / 2.0).collect();
+                self.dvol = parallel;
+            }
+            _ => {
+                self.dvol = parallel + near;
+            }
+        }
+        self.sync_slider_thumbs(window, cx);
+        self.schedule_view(cx);
+        cx.notify();
+    }
+
+    fn sync_slider_thumbs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.slider_sync = false;
+        let dv = self.dvol as f32;
+        self.iv_slider.update(cx, |s, cx| s.set_value(dv, window, cx));
+        for ((_, _, sl), x) in self.exp_sliders.iter().zip(&self.exp_shifts) {
+            let v = *x as f32;
+            sl.update(cx, |s, cx| s.set_value(v, window, cx));
         }
     }
 
@@ -512,6 +596,7 @@ impl StudioPage {
                         this.view = None;
                         let h = this.horizon_days();
                         this.reset_sliders(h, cx);
+                        this.rebuild_exp_sliders(cx);
                         this.schedule_view(cx);
                     }
                     Err(e) => this.error = Some(e),
@@ -550,7 +635,15 @@ impl StudioPage {
         if let Some(v) = view {
             let pts: Vec<(f64, f64)> = v.curve.iter().filter(|c| c.1.is_finite()).map(|c| (c.0, if pnl { c.2 } else { c.1 })).collect();
             let label = if v.elapsed_days <= 0.0 { "選定日期：今天".to_string() } else { format!("選定日期：第 {:.0} 天", v.elapsed_days) };
-            let label = if v.vol_shift.abs() > 1e-9 { format!("{label} · IV {:+.1} 點", v.vol_shift * 100.0) } else { label };
+            let label = if !v.scenario.is_zero() {
+                if v.scenario.term.is_empty() {
+                    format!("{label} · IV {:+.1} 點", v.scenario.parallel * 100.0)
+                } else {
+                    format!("{label} · IV 情境")
+                }
+            } else {
+                label
+            };
             main = main.series(Series::line(label, pts, p.cyan).width(3.0));
             let y = if pnl { v.pnl_at_spot } else { v.value_at_spot };
             if y.is_finite() {
@@ -582,6 +675,7 @@ impl StudioPage {
         let pr = &o.priced;
         let fin = |v: &[(f64, f64)]| -> Vec<(f64, f64)> { v.iter().copied().filter(|(_, y)| y.is_finite()).collect() };
         let main = Self::main_chart(o, None, pnl, 0.0, dvol);
+        // (dvol only flags "IV moved" for dimming; the cyan curve carries the real scenario)
         // densities as probability per 1% of spot
         let scale = pr.spot * 0.01;
         let dq: Vec<(f64, f64)> = pr.density.iter().filter(|d| d.0 >= o.lo && d.0 <= o.hi).map(|d| (d.0, d.1 * scale)).collect();
@@ -801,7 +895,7 @@ impl StudioPage {
             let g = v.greeks;
             let day0 = v.elapsed_days <= 0.0;
             // on day 0 without an IV shift the P&L is identically ~0 at spot: crossings are noise
-            let be = if v.breakevens.is_empty() || (day0 && v.vol_shift == 0.0) {
+            let be = if v.breakevens.is_empty() || (day0 && v.scenario.is_zero()) {
                 "—".to_string()
             } else {
                 v.breakevens.iter().map(|b| format!("{b:.1}")).collect::<Vec<_>>().join(" / ")
@@ -816,6 +910,10 @@ impl StudioPage {
                 .child(kpi_sm("獲利機率 P / Q", if day0 { "—".to_string() } else { format!("{} / {}", pct(v.prob_profit_p), pct(v.prob_profit_q)) }, None, cx).min_w(px(104.0)))
                 .child(kpi_sm("期望損益 P", if day0 { "—".to_string() } else { money(v.expected_pnl_p * u) }, if day0 { None } else { Some(sign_color(v.expected_pnl_p)) }, cx).min_w(px(104.0)))
                 .child(kpi_sm("損益兩平", be, Some(p.orange), cx));
+            if v.vega_by_expiry.len() >= 2 {
+                let txt = v.vega_by_expiry.iter().map(|(d, vg)| format!("@{d:.0}d {}", money(vg * u))).collect::<Vec<_>>().join(" · ");
+                kpis = kpis.child(kpi_sm("Vega 分到期 $/點", txt, Some(p.purple), cx).min_w(px(220.0)));
+            }
         }
         panel_with(
             "時間 & 波動率情境 · 任一日期的組合價值",
@@ -845,12 +943,43 @@ impl StudioPage {
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(div().w(px(170.0)).flex_none().text_size(px(12.0)).font_family(MONO_FONT).text_color(if self.dvol.abs() > 1e-9 { p.yellow } else { p.muted }).child(format!("IV 變動 {:+.1} 點", self.dvol)))
-                        .child(div().flex_1().min_w(px(100.0)).child(Slider::new(&self.iv_slider)))
-                        .child(chip("iv-reset", "IV 歸零", false, cx).on_click(cx.listener(|this, _, window, cx| {
-                            this.playing = 0;
-                            this.set_dvol(0.0, window, cx);
-                        }))),
+                        .child(div().w(px(250.0)).flex_none().whitespace_nowrap().text_size(px(11.5)).font_family(MONO_FONT).text_color(if self.dvol.abs() > 1e-9 { p.yellow } else { p.muted }).child(format!("整體 IV {:+.1} 點", self.dvol)))
+                        .child(div().flex_1().min_w(px(100.0)).child(Slider::new(&self.iv_slider))),
+                )
+                .children(self.exp_sliders.iter().enumerate().map(|(i, (d, _, sl))| {
+                    let n = self.exp_sliders.len();
+                    let name = if n == 2 {
+                        format!("{} @{d:.0}d", if i == 0 { "近月" } else { "遠月" })
+                    } else if i == 0 {
+                        format!("近月 @{d:.0}d")
+                    } else if i + 1 == n {
+                        format!("遠月 @{d:.0}d")
+                    } else {
+                        format!("@{d:.0}d")
+                    };
+                    let total = self.dvol + self.exp_shifts.get(i).copied().unwrap_or(0.0);
+                    let vega = self.view.as_ref().and_then(|v| v.vega_by_expiry.iter().find(|e| (e.0 - d).abs() < 0.5).map(|e| e.1 * o.priced.units));
+                    let vtxt = vega.map(|v| format!(" · Vega {}", money(v))).unwrap_or_default();
+                    h_flex()
+                        .gap_2()
+                        .child(div().w(px(250.0)).flex_none().whitespace_nowrap().text_size(px(11.5)).font_family(MONO_FONT).text_color(if total.abs() > 1e-9 { p.yellow } else { p.muted }).child(format!("{name} {total:+.1}點{vtxt}")))
+                        .child(div().flex_1().min_w(px(100.0)).child(Slider::new(sl)))
+                }))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .flex_wrap()
+                        .when(!self.exp_sliders.is_empty(), |d| {
+                            d.child(chip("iv-link", "連動", self.linked, cx).on_click(cx.listener(|this, _, _, cx| {
+                                this.linked = !this.linked;
+                                cx.notify();
+                            })))
+                        })
+                        .child(chip("iv-reset", "全部歸零", false, cx).on_click(cx.listener(|this, _, window, cx| this.apply_preset(0.0, 0.0, 0.0, window, cx))))
+                        .child(div().w(px(6.0)))
+                        .child(chip("pre-earn", "財報後近月 IV 崩跌", false, cx).on_click(cx.listener(|this, _, window, cx| this.apply_preset(0.0, -8.0, -2.0, window, cx))))
+                        .child(chip("pre-panic", "恐慌：全面上升", false, cx).on_click(cx.listener(|this, _, window, cx| this.apply_preset(10.0, 0.0, 0.0, window, cx))))
+                        .child(chip("pre-steep", "期限結構陡峭化", false, cx).on_click(cx.listener(|this, _, window, cx| this.apply_preset(0.0, -3.0, 3.0, window, cx)))),
                 )
                 .child(kpis),
         )
@@ -1062,7 +1191,10 @@ impl StudioPage {
 }
 
 impl Render for StudioPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.slider_sync {
+            self.sync_slider_thumbs(window, cx);
+        }
         let p = palette();
         let left = self.render_left(cx);
         let middle = self.render_middle(cx);
