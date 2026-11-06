@@ -284,9 +284,19 @@ enum Cmd {
         /// Time slider: value the book on these days from today (comma separated, e.g. 0,15,30).
         #[arg(long)]
         at: Option<String>,
-        /// IV shift in vol points for --at (e.g. -5 for a vol crush).
+        /// IV shift in vol points for --at (e.g. -5 for a vol crush), applied to all expiries.
         #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         vol_shift: f64,
+        /// Extra IV shift (vol points) for the earliest expiry (near month).
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        vol_near: f64,
+        /// Extra IV shift (vol points) for the latest expiry (far month); expiries in between
+        /// are interpolated in time.
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        vol_far: f64,
+        /// Per-expiry IV shifts "days:points,…", e.g. "30:-8,90:-2" (overrides --vol-near/--vol-far).
+        #[arg(long, allow_hyphen_values = true)]
+        vol_term: Option<String>,
     },
     /// List strategy templates, or analyse one on a synthetic market.
     Strategies {
@@ -636,8 +646,8 @@ fn main() -> Result<()> {
                 print_strategy(&s, &MarketParams::new(chain.spot, r, q), a.surface.iv(chain.spot, 1.0).unwrap_or(0.2));
             }
         }
-        Cmd::Payoff { expr, file, examples, symbol, spot, iv, days, rate, div, skew, units, mu, style, step, chain_file, provider, csv, at, vol_shift } => {
-            run_payoff(PayoffArgs { expr, file, examples, symbol, spot, iv, days, rate, div, skew, units, mu, style, step, chain_file, provider, csv, at, vol_shift })?;
+        Cmd::Payoff { expr, file, examples, symbol, spot, iv, days, rate, div, skew, units, mu, style, step, chain_file, provider, csv, at, vol_shift, vol_near, vol_far, vol_term } => {
+            run_payoff(PayoffArgs { expr, file, examples, symbol, spot, iv, days, rate, div, skew, units, mu, style, step, chain_file, provider, csv, at, vol_shift, vol_near, vol_far, vol_term })?;
         }
         Cmd::Strategies { template, spot, iv, rate, div } => match template {
             None => {
@@ -702,10 +712,13 @@ struct PayoffArgs {
     csv: Option<std::path::PathBuf>,
     at: Option<String>,
     vol_shift: f64,
+    vol_near: f64,
+    vol_far: f64,
+    vol_term: Option<String>,
 }
 
 fn run_payoff(a: PayoffArgs) -> Result<()> {
-    use optlab_core::payoff::{compile_book, date_view, examples, parse, price, value_curve, CompileOptions, Instrument, LegStyle, Market, StrikeGrid, SyntheticMarket};
+    use optlab_core::payoff::{compile_book, date_view_scenario, examples, VolScenario, parse, price, value_curve, CompileOptions, Instrument, LegStyle, Market, StrikeGrid, SyntheticMarket};
     if a.examples {
         println!("Payoff 語言：S = 到期價格，spot = 現價，110% = 1.10×spot；+ - * / ^；變數 a = 600；以 ; 或換行分隔");
         println!("基本元件：call(K) put(K) digital(K) digitalput(K) pwl(x1,y1,x2,y2,…)");
@@ -845,9 +858,24 @@ fn run_payoff(a: PayoffArgs) -> Result<()> {
             bail!("--at 需要天數，例如 --at 0,15,30");
         }
         let grid: Vec<f64> = [0.8, 0.9, 0.95, 1.0, 1.05, 1.1, 1.2].iter().map(|m| spot * m).collect();
+        let mut sc = match &a.vol_term {
+            Some(t) => {
+                let mut pts = Vec::new();
+                for part in t.split(',') {
+                    let (d, v) = part.split_once(':').with_context(|| format!("--vol-term 格式應為 天數:點數，收到「{part}」"))?;
+                    let d: f64 = d.trim().parse().with_context(|| format!("天數「{d}」"))?;
+                    let v: f64 = v.trim().parse().with_context(|| format!("點數「{v}」"))?;
+                    pts.push((mkt.t_for_days(d), v / 100.0));
+                }
+                VolScenario { parallel: 0.0, term: pts }
+            }
+            None => VolScenario::near_far(&px, a.vol_near / 100.0, a.vol_far / 100.0),
+        };
+        sc.parallel = a.vol_shift / 100.0;
+        let desc: Vec<String> = px.expiries().iter().map(|e| format!("@{:.0}d {:+.1}", e.0, sc.shift_for(e.1) * 100.0)).collect();
         println!(
-            "\n時間滑桿（IV 變動 {:+.1} 點；最遠可看到最早到期日 {} 天；每單位損益）",
-            a.vol_shift,
+            "\n時間滑桿（IV 情境：{}；最遠可看到最早到期日 {} 天；每單位損益）",
+            if desc.is_empty() { format!("{:+.1}", a.vol_shift) } else { desc.join("  ") },
             px.horizon_days
         );
         print!("{:>6} {:>10} {:>10} {:>8} {:>9} {:>8} {:>9}", "天數", "價值@現價", "損益@現價", "Δ", "Θ/天", "Vega", "獲利機率");
@@ -856,7 +884,7 @@ fn run_payoff(a: PayoffArgs) -> Result<()> {
         }
         println!();
         for d in days {
-            let v = date_view(&px, &mkt, &grid, d, a.vol_shift / 100.0);
+            let v = date_view_scenario(&px, &mkt, &grid, d, &sc);
             print!(
                 "{:>6.0} {:>10.3} {:>10.3} {:>8.3} {:>9.4} {:>8.4} {:>9}",
                 v.elapsed_days,
@@ -869,6 +897,10 @@ fn run_payoff(a: PayoffArgs) -> Result<()> {
             );
             for c in &v.curve {
                 print!(" {:>9.2}", c.2);
+            }
+            if v.vega_by_expiry.len() > 1 {
+                let vb: Vec<String> = v.vega_by_expiry.iter().map(|(d, x)| format!("@{d:.0}d {x:+.3}")).collect();
+                print!("   Vega 分到期：{}", vb.join(" "));
             }
             println!();
         }

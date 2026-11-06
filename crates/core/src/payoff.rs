@@ -1609,6 +1609,76 @@ fn real_world_density(xs: &[f64], qd: &[f64], hk: f64, s: f64, r: f64, q: f64, m
     tilt(0.5 * (a + b))
 }
 
+/// IV scenario for the time slider: a parallel shift plus an optional term structure of
+/// shifts by expiry, interpolated linearly in time to expiry (flat outside the points).
+/// Shifts are decimals (0.05 = +5 vol points).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct VolScenario {
+    pub parallel: f64,
+    /// (years to expiry, shift) points.
+    #[serde(default)]
+    pub term: Vec<(f64, f64)>,
+}
+
+impl VolScenario {
+    pub fn parallel(shift: f64) -> Self {
+        Self { parallel: shift, term: Vec::new() }
+    }
+    /// Near/far shifts: `near` applies to the earliest option expiry, `far` to the latest,
+    /// expiries in between are interpolated in time.
+    pub fn near_far(priced: &PricedPayoff, near: f64, far: f64) -> Self {
+        let ex = priced.expiries();
+        match (ex.first(), ex.last()) {
+            (Some(a), Some(b)) if (b.1 - a.1).abs() > 1e-9 => Self { parallel: 0.0, term: vec![(a.1, near), (b.1, far)] },
+            (Some(a), _) => Self { parallel: 0.0, term: vec![(a.1, near)] },
+            _ => Self::parallel(near),
+        }
+    }
+    /// One shift per option expiry of the book, `shifts[i]` for `priced.expiries()[i]`.
+    pub fn per_expiry(priced: &PricedPayoff, shifts: &[f64]) -> Self {
+        Self { parallel: 0.0, term: priced.expiries().iter().zip(shifts).map(|(e, s)| (e.1, *s)).collect() }
+    }
+    /// Total shift for an option expiring in `t` years.
+    pub fn shift_for(&self, t: f64) -> f64 {
+        let mut pts = self.term.clone();
+        pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let term = match pts.len() {
+            0 => 0.0,
+            1 => pts[0].1,
+            _ => {
+                if t <= pts[0].0 {
+                    pts[0].1
+                } else if t >= pts[pts.len() - 1].0 {
+                    pts[pts.len() - 1].1
+                } else {
+                    let i = pts.partition_point(|p| p.0 <= t).max(1);
+                    let (t0, v0) = pts[i - 1];
+                    let (t1, v1) = pts[i];
+                    if t1 > t0 {
+                        v0 + (v1 - v0) * (t - t0) / (t1 - t0)
+                    } else {
+                        v1
+                    }
+                }
+            }
+        };
+        self.parallel + term
+    }
+    pub fn is_zero(&self) -> bool {
+        self.parallel == 0.0 && self.term.iter().all(|p| p.1 == 0.0)
+    }
+}
+
+impl PricedPayoff {
+    /// Distinct option expiries of the book, sorted: (calendar days, years).
+    pub fn expiries(&self) -> Vec<(f64, f64)> {
+        let mut v: Vec<(f64, f64)> = self.legs.iter().filter(|l| l.leg.strike().is_some()).map(|l| ((l.t * 365.0).round(), l.t)).collect();
+        v.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        v.dedup_by(|a, b| (a.1 - b.1).abs() < 1e-9);
+        v
+    }
+}
+
 /// Snapshot of the book on a chosen future date (the "time slider").
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DateView {
@@ -1617,8 +1687,14 @@ pub struct DateView {
     pub elapsed_days: f64,
     /// Days left until the horizon (earliest expiry).
     pub days_to_horizon: f64,
-    /// IV shift applied to every option (decimal).
+    /// Parallel IV shift applied to every option (decimal).
     pub vol_shift: f64,
+    /// Full IV scenario used (parallel + per-expiry term shifts).
+    #[serde(default)]
+    pub scenario: VolScenario,
+    /// Vega per expiry at today's spot on that date: (expiry days, $ per vol point per unit).
+    #[serde(default)]
+    pub vega_by_expiry: Vec<(f64, f64)>,
     /// Cost grown at the risk-free rate to this date (per unit).
     pub cost_fv: f64,
     /// Book value per unit at today's spot on that date.
@@ -1643,9 +1719,15 @@ pub struct DateView {
 /// `vol_shift`. `spots` is the plotting grid; probabilities use the smile density of S on
 /// that date (and the Esscher-tilted real-world density with the book's μ).
 pub fn date_view(priced: &PricedPayoff, mkt: &Market, spots: &[f64], elapsed_days: f64, vol_shift: f64) -> DateView {
+    date_view_scenario(priced, mkt, spots, elapsed_days, &VolScenario::parallel(vol_shift))
+}
+
+/// [`date_view`] with a full IV scenario (e.g. near-month and far-month shifted
+/// separately via [`VolScenario::near_far`] or [`VolScenario::per_expiry`]).
+pub fn date_view_scenario(priced: &PricedPayoff, mkt: &Market, spots: &[f64], elapsed_days: f64, sc: &VolScenario) -> DateView {
     let (r, q, s) = (priced.r, priced.q, priced.spot);
     let elapsed = (elapsed_days / 365.0).clamp(0.0, priced.t);
-    let val = |x: f64| -> f64 { priced.legs.iter().map(|l| l.value_at_iv(x, elapsed, r, q, vol_shift)).sum() };
+    let val = |x: f64| -> f64 { priced.legs.iter().map(|l| l.value_at_iv(x, elapsed, r, q, sc.shift_for(l.t))).sum() };
     let cost_fv = priced.price_mid * (r * elapsed).exp();
     let curve: Vec<(f64, f64, f64)> = spots.iter().map(|&x| {
         let v = val(x);
@@ -1660,6 +1742,7 @@ pub fn date_view(priced: &PricedPayoff, mkt: &Market, spots: &[f64], elapsed_day
     }
     // Greeks at today's spot on that date
     let mut g = Greeks::default();
+    let mut vega_by_expiry: Vec<(f64, f64)> = priced.expiries().iter().map(|e| (e.0, 0.0)).collect();
     for l in &priced.legs {
         let rem = l.t - elapsed;
         let leg = l.leg;
@@ -1668,9 +1751,15 @@ pub fn date_view(priced: &PricedPayoff, mkt: &Market, spots: &[f64], elapsed_day
             Instrument::Stock => Greeks { price: s * (-q * rem.max(0.0)).exp(), delta: (-q * rem.max(0.0)).exp(), ..Default::default() },
             Instrument::Call(k) | Instrument::Put(k) => {
                 let kind = if matches!(leg.instrument, Instrument::Call(_)) { OptionKind::Call } else { OptionKind::Put };
-                bs_greeks(kind, s, k, rem.max(0.0), r, q, (l.iv + vol_shift).max(0.01))
+                bs_greeks(kind, s, k, rem.max(0.0), r, q, (l.iv + sc.shift_for(l.t)).max(0.01))
             }
         };
+        if leg.strike().is_some() {
+            let d = (l.t * 365.0).round();
+            if let Some(e) = vega_by_expiry.iter_mut().find(|e| (e.0 - d).abs() < 0.5) {
+                e.1 += gk.vega * leg.qty;
+            }
+        }
         g = g + gk * leg.qty;
     }
     let value_at_spot = val(s);
@@ -1700,7 +1789,9 @@ pub fn date_view(priced: &PricedPayoff, mkt: &Market, spots: &[f64], elapsed_day
         elapsed,
         elapsed_days: (elapsed * 365.0).round(),
         days_to_horizon: ((priced.t - elapsed) * 365.0).round().max(0.0),
-        vol_shift,
+        vol_shift: sc.parallel,
+        scenario: sc.clone(),
+        vega_by_expiry,
         cost_fv,
         value_at_spot,
         pnl_at_spot: value_at_spot - cost_fv,
@@ -2063,6 +2154,38 @@ mod tests {
         assert!(d0.greeks.theta > 0.0);
         assert!(d20.pnl_at_spot > 0.0, "{}", d20.pnl_at_spot);
         assert!(d20.days_to_horizon == 10.0);
+    }
+
+    #[test]
+    fn vol_scenario_near_far_on_a_calendar() {
+        let mkt = Market::Synthetic(SyntheticMarket { skew: 0.0, curv: 0.0, ..SyntheticMarket::new(600.0, 30.0 / 365.0, 0.04, 0.0, 0.2) });
+        let pr = p("call(600) @ 90 - call(600) @ 30");
+        let rep = compile_book(&pr, 30.0, &|_| CompileOptions::free(600.0)).unwrap();
+        let px = price(&pr, &rep, &mkt, 100.0, 0.08);
+        assert_eq!(px.expiries().iter().map(|e| e.0).collect::<Vec<_>>(), vec![30.0, 90.0]);
+        let spots = [600.0];
+        let base = date_view(&px, &mkt, &spots, 0.0, 0.0);
+        // a calendar is short front-month vega and long back-month vega
+        assert!(base.vega_by_expiry[0].1 < 0.0 && base.vega_by_expiry[1].1 > 0.0, "{:?}", base.vega_by_expiry);
+        // front-month IV crush only: the calendar gains; back-month crush only: it loses
+        let front = date_view_scenario(&px, &mkt, &spots, 0.0, &VolScenario::near_far(&px, -0.05, 0.0));
+        let back = date_view_scenario(&px, &mkt, &spots, 0.0, &VolScenario::near_far(&px, 0.0, -0.05));
+        assert!(front.pnl_at_spot > 0.0 && back.pnl_at_spot < 0.0, "{} {}", front.pnl_at_spot, back.pnl_at_spot);
+        // ≈ −vega_i × shift
+        assert!((front.pnl_at_spot + base.vega_by_expiry[0].1 * 5.0).abs() < 0.15);
+        assert!((back.pnl_at_spot + base.vega_by_expiry[1].1 * 5.0).abs() < 0.15);
+        // equal near/far shifts = parallel shift
+        let both = date_view_scenario(&px, &mkt, &spots, 0.0, &VolScenario::near_far(&px, -0.05, -0.05));
+        let par = date_view(&px, &mkt, &spots, 0.0, -0.05);
+        assert!((both.value_at_spot - par.value_at_spot).abs() < 1e-12);
+        // per-expiry constructor and interpolation
+        let sc = VolScenario { parallel: 0.01, term: vec![(0.1, -0.04), (0.3, 0.0)] };
+        assert!((sc.shift_for(0.2) - (0.01 - 0.02)).abs() < 1e-12);
+        assert!((sc.shift_for(0.05) - (0.01 - 0.04)).abs() < 1e-12);
+        assert!((sc.shift_for(1.0) - 0.01).abs() < 1e-12);
+        let pe = VolScenario::per_expiry(&px, &[-0.05, 0.0]);
+        let v = date_view_scenario(&px, &mkt, &spots, 0.0, &pe);
+        assert!((v.value_at_spot - front.value_at_spot).abs() < 1e-12);
     }
 
 }
